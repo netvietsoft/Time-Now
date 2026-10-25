@@ -1,0 +1,6 @@
+﻿id,name,base_id,category_id,type,update_time,version,water_mark_content,is_pgc,pgc_Order
+wm_10011,"Real-Time Official Anti-Tamper",10011,cat_time_gps,1,1761108000000,3.2,"{""base_id"":""10011"",""theme"":""#2563EB"",""antiFake"":true,""items"":[""time"",""date"",""latlng"",""address"",""weather"",""compass"",""antiCode""]}",1,1
+wm_20,"Engineering Construction Log",20,cat_construction,1,1761108000000,2.8,"{""base_id"":""20"",""theme"":""#F59E0B"",""antiFake"":true,""items"":[""project_name"",""construction_area"",""content"",""inspector"",""time"",""address""]}",1,2
+wm_57,"AI Steel Rebar Counter (CVModel=4)",57,cat_construction,2,1761108000000,4.0,"{""base_id"":""57"",""cvModelId"":4,""theme"":""#EF4444"",""items"":[""steel_count"",""batch_no"",""operator"",""time"",""latlng""]}",1,3
+wm_34,"Geofence Shift Attendance",34,cat_attendance,1,1761108000000,3.0,"{""base_id"":""34"",""theme"":""#10B981"",""lockTime"":true,""items"":[""shift_time"",""employee_name"",""geofence_name"",""company_logo"",""antiCode""]}",1,4
+wm_52,"AI License Plate Recognition (CVModel=1)",52,cat_patrol_security,2,1761108000000,2.1,"{""base_id"":""52"",""cvModelId"":1,""theme"":""#3B82F6"",""items"":[""plate_number"",""vehicle_type"",""gate_name"",""time""]}",1,5

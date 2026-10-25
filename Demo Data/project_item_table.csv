@@ -1,0 +1,4 @@
+﻿project_id,team_id,project_name,address,lat,lng,radius,photo_count,status,updated_at
+proj_01,team_vn_001,"Ga Ng?m Ba Son - T?ng B2","2 T?n ??c Th?ng, B?n Ngh?, Qu?n 1, TP.HCM",10.7815,106.7072,250,6420,1,1761109100000
+proj_02,team_vn_001,"Depot Long B?nh - Khu B?o D??ng","Long B?nh, TP. Th? ??c, TP.HCM",10.8754,106.8291,500,5180,1,1761109150000
+proj_03,team_vn_002,"Ph?n Khu The Origami - Tu?n Tra ??m","Nguy?n Xi?n, Long Th?nh M?, TP. Th? ??c",10.8421,106.8365,300,4890,1,1761109300000

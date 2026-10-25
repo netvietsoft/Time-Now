@@ -1,0 +1,25 @@
+7767517
+22 30
+Input            input                    0 1 input
+Convolution      /e_conv1/Conv            1 1 input /e_conv1/Conv_output_0 0=32 1=3 11=3 2=1 12=1 3=1 13=1 4=1 14=1 15=1 16=1 5=1 6=864
+ReLU             /relu/Relu               1 1 /e_conv1/Conv_output_0 /relu/Relu_output_0
+Split            splitncnn_0              1 2 /relu/Relu_output_0 /relu/Relu_output_0_splitncnn_0 /relu/Relu_output_0_splitncnn_1
+Convolution      /e_conv2/Conv            1 1 /relu/Relu_output_0_splitncnn_1 /e_conv2/Conv_output_0 0=32 1=3 11=3 2=1 12=1 3=1 13=1 4=1 14=1 15=1 16=1 5=1 6=9216
+ReLU             /relu_1/Relu             1 1 /e_conv2/Conv_output_0 /relu_1/Relu_output_0
+Split            splitncnn_1              1 2 /relu_1/Relu_output_0 /relu_1/Relu_output_0_splitncnn_0 /relu_1/Relu_output_0_splitncnn_1
+Convolution      /e_conv3/Conv            1 1 /relu_1/Relu_output_0_splitncnn_1 /e_conv3/Conv_output_0 0=32 1=3 11=3 2=1 12=1 3=1 13=1 4=1 14=1 15=1 16=1 5=1 6=9216
+ReLU             /relu_2/Relu             1 1 /e_conv3/Conv_output_0 /relu_2/Relu_output_0
+Split            splitncnn_2              1 2 /relu_2/Relu_output_0 /relu_2/Relu_output_0_splitncnn_0 /relu_2/Relu_output_0_splitncnn_1
+Convolution      /e_conv4/Conv            1 1 /relu_2/Relu_output_0_splitncnn_1 /e_conv4/Conv_output_0 0=32 1=3 11=3 2=1 12=1 3=1 13=1 4=1 14=1 15=1 16=1 5=1 6=9216
+ReLU             /relu_3/Relu             1 1 /e_conv4/Conv_output_0 /relu_3/Relu_output_0
+Concat           /Concat                  2 1 /relu_2/Relu_output_0_splitncnn_0 /relu_3/Relu_output_0 /Concat_output_0 0=0
+Convolution      /e_conv5/Conv            1 1 /Concat_output_0 /e_conv5/Conv_output_0 0=32 1=3 11=3 2=1 12=1 3=1 13=1 4=1 14=1 15=1 16=1 5=1 6=18432
+ReLU             /relu_4/Relu             1 1 /e_conv5/Conv_output_0 /relu_4/Relu_output_0
+Concat           /Concat_1                2 1 /relu_1/Relu_output_0_splitncnn_0 /relu_4/Relu_output_0 /Concat_1_output_0 0=0
+Convolution      /e_conv6/Conv            1 1 /Concat_1_output_0 /e_conv6/Conv_output_0 0=32 1=3 11=3 2=1 12=1 3=1 13=1 4=1 14=1 15=1 16=1 5=1 6=18432
+ReLU             /relu_5/Relu             1 1 /e_conv6/Conv_output_0 /relu_5/Relu_output_0
+Concat           /Concat_2                2 1 /relu/Relu_output_0_splitncnn_0 /relu_5/Relu_output_0 /Concat_2_output_0 0=0
+Convolution      /e_conv7/Conv            1 1 /Concat_2_output_0 /e_conv7/Conv_output_0 0=18 1=3 11=3 2=1 12=1 3=1 13=1 4=1 14=1 15=1 16=1 5=1 6=10368
+UnaryOp          /Tanh                    1 1 /e_conv7/Conv_output_0 /Tanh_output_0 0=16
+Slice            /Split                   1 6 /Tanh_output_0 output0 output1 output2 output3 output4 output5 -23300=6,3,3,3,3,3,-233 1=0
+n

@@ -1,0 +1,4 @@
+﻿template_id,type_id,title,preview_url,format_type,config_json,vip_required
+tpl_pdf_4grid,type_construction,"B?o C?o Nghi?m Thu C?ng Tr??ng (4 ?nh / Trang PDF)",https://static.xhey.top/report/pdf_4grid.png,PDF,"{""photosPerPage"":4,""showCover"":true,""showAntiFakeQr"":true}",0
+tpl_xlsx_poi,type_attendance,"B?ng K? Chi Ti?t ?nh & T?a ?? GPS (Excel .xlsx)",https://static.xhey.top/report/xlsx_full.png,EXCEL,"{""engine"":""ApachePOI"",""embedThumbnail"":true,""columns"":[""No"",""Photo"",""Time"",""LatLng"",""Address"",""PhotoCode"",""Remark""]}",1
+tpl_kmz_earth,type_survey,"B?n ?? Kh?o S?t ??a H?nh Google Earth (.KMZ)",https://static.xhey.top/report/kmz_earth.png,KMZ,"{""includePlacemarks"":true,""bundleOriginalJpeg"":false}",1

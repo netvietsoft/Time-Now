@@ -1,0 +1,4 @@
+﻿team_id,team_name,role,member_count,photo_count,plan_type,storage_used_bytes,storage_limit_bytes,avatar_url,settings_json,updated_at
+team_vn_001,"Coteccons Metro Line 1 Engineering",1,42,18450,2,68934205440,107374182400,https://static.xhey.top/teams/metro1.png,"{""forceLiveCapture"":true,""blockMockGps"":true,""onedriveSync"":true}",1761109000000
+team_vn_002,"Vinhomes Grand Park Facility Patrol",2,28,9320,2,31138512896,107374182400,https://static.xhey.top/teams/vhgp.png,"{""forceLiveCapture"":true,""requireQrPatrol"":true}",1761109200000
+team_br_003,"Sao Paulo Solar Grid Installation",1,15,4120,1,8589934592,53687091200,https://static.xhey.top/teams/solar_sp.png,"{""forceLiveCapture"":true,""autoExportPdf"":true}",1761109500000

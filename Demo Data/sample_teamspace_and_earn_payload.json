@@ -1,0 +1,63 @@
+{
+  "code": 200,
+  "msg": "success",
+  "status": 0,
+  "data": {
+    "teamspaceOverview": {
+      "teamId": "team_vn_001",
+      "teamName": "Coteccons Metro Line 1 Engineering",
+      "subscriptionPlan": "TEAMSPACE_BUSINESS_PRO",
+      "billingChannel": "STRIPE_WEB_CHECKOUT",
+      "storageUsedBytes": 68934205440,
+      "storageLimitBytes": 107374182400,
+      "thirdPartyIntegrations": [
+        {
+          "provider": "MICROSOFT_ONEDRIVE",
+          "msalClientId": "f5b5aa14-ffe7-46c0-9eb9-f9b7bc628d54",
+          "autoSyncEnabled": true,
+          "targetFolder": "/Timemark_Teamspace/Metro_Line_1"
+        }
+      ],
+      "geofenceRules": [
+        {
+          "geofenceId": "geo_bason_01",
+          "name": "Ga Ngầm Ba Son - Cổng Số 2",
+          "centerLat": 10.78152,
+          "centerLng": 106.70724,
+          "radiusMeters": 150,
+          "requireLiveCameraCapture": true
+        }
+      ]
+    },
+    "embodiedAiEarnModule": {
+      "walletBalanceFen": 18500,
+      "currency": "BRL",
+      "payoutMethods": [
+        {
+          "country": "BR",
+          "channel": "PIX",
+          "minAmountFen": 3000,
+          "maxAmountFen": 500000
+        },
+        {
+          "country": "MX",
+          "channel": "SPEI_BANK",
+          "minAmountFen": 10000,
+          "maxAmountFen": 5000000
+        }
+      ],
+      "activeRoboticsTask": {
+        "taskId": 402,
+        "title": "First-Person Hand Tool Assembly (Egocentric Video)",
+        "rewardAmountFen": 1500,
+        "containerFormat": "ROS2_MCAP",
+        "requiredStreams": [
+          "HEVC_VIDEO_1080P_30FPS",
+          "MEDIAPIPE_21_HAND_LANDMARKS",
+          "IMU_4_SENSORS_ACCEL_GYRO_GRAVITY_ROTVEC",
+          "PCM_AUDIO_48KHZ_VOICE_COMMUNICATION"
+        ]
+      }
+    }
+  }
+}

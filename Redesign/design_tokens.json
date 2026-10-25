@@ -1,0 +1,123 @@
+{
+  "meta": {
+    "appName": "Timemark Camera (Time & GPS Anti-Tamper Camera)",
+    "packageName": "com.oceangalaxy.camera.new",
+    "versionName": "10.0.281",
+    "versionCode": 100028100,
+    "designSystem": "Timemark Industrial High-Contrast Design System v2.0",
+    "viewportStandard": {
+      "widthDp": 390,
+      "heightDp": 844,
+      "density": "xxhdpi (3.0x)"
+    }
+  },
+  "colors": {
+    "brand": {
+      "primary": "#2563EB",
+      "primaryOriginal": "#0066FF",
+      "primaryHover": "#1D4ED8",
+      "primarySoft": "rgba(37, 99, 235, 0.14)",
+      "industrialAmber": "#F59E0B",
+      "industrialOrangeOriginal": "#FF6B00"
+    },
+    "semantic": {
+      "verifiedEmerald": "#10B981",
+      "verifiedBg": "rgba(16, 185, 129, 0.15)",
+      "warningAmber": "#F59E0B",
+      "dangerRed": "#EF4444",
+      "infoCyan": "#06B6D4"
+    },
+    "monetization": {
+      "vipGoldStart": "#FBBF24",
+      "vipGoldEnd": "#D97706",
+      "vipSurfaceDark": "#0F141F",
+      "businessBlueStart": "#2563EB",
+      "businessBlueEnd": "#1E40AF",
+      "earnPurple": "#6366F1",
+      "earnCyan": "#06B6D4"
+    },
+    "darkTheme": {
+      "background": "#090D16",
+      "surface": "#111827",
+      "surfaceElevated": "#1E293B",
+      "glassOverlay": "rgba(15, 23, 42, 0.76)",
+      "textPrimary": "#F8FAFC",
+      "textSecondary": "#94A3B8",
+      "border": "rgba(255, 255, 255, 0.10)"
+    },
+    "lightTheme": {
+      "background": "#F8FAFC",
+      "surface": "#FFFFFF",
+      "surfaceElevated": "#F1F5F9",
+      "glassOverlay": "rgba(255, 255, 255, 0.85)",
+      "textPrimary": "#0F172A",
+      "textSecondary": "#64748B",
+      "border": "#E2E8F0"
+    }
+  },
+  "typography": {
+    "fontFamilies": {
+      "uiPrimary": "'Inter', 'Roboto', -apple-system, BlinkMacSystemFont, sans-serif",
+      "digitalClock": "'Segment7Standard', 'Quartz-Regular', 'JetBrains Mono', monospace",
+      "industrialHeader": "'BebasNeue', 'YouSheBiaoTiHei-2', sans-serif",
+      "telemetryMono": "'RobotoMono-Bold', 'JetBrains Mono', monospace"
+    },
+    "scale": {
+      "clockDisplay": { "sizePx": 34, "weight": 800, "lineHeight": 1.05, "letterSpacing": "-0.02em" },
+      "h1": { "sizePx": 22, "weight": 700, "lineHeight": 1.25 },
+      "h2": { "sizePx": 18, "weight": 700, "lineHeight": 1.3 },
+      "h3": { "sizePx": 15, "weight": 600, "lineHeight": 1.35 },
+      "body": { "sizePx": 13, "weight": 500, "lineHeight": 1.45 },
+      "caption": { "sizePx": 11, "weight": 500, "lineHeight": 1.35 },
+      "antiFakeCode": { "sizePx": 10, "weight": 700, "lineHeight": 1.2, "letterSpacing": "0.08em" }
+    }
+  },
+  "layoutCoordinatesDp": {
+    "PreviewActivity": {
+      "topControlBar": { "x": 0, "y": 44, "w": 390, "h": 48 },
+      "viewfinderCanvas": { "x": 0, "y": 92, "w": 390, "h": 560 },
+      "miniMapCompassWidget": { "x": 16, "y": 108, "w": 96, "h": 96 },
+      "liveWatermarkCard": { "x": 16, "y": 468, "w": 320, "h": 168 },
+      "antiFakeCodeStrip": { "x": 362, "y": 468, "w": 16, "h": 168 },
+      "modeSelectorTabs": { "x": 0, "y": 652, "w": 390, "h": 40 },
+      "bottomShutterBar": { "x": 0, "y": 692, "w": 390, "h": 118 }
+    },
+    "TeamSpaceHomeParentActivity": {
+      "teamHeader": { "x": 0, "y": 44, "w": 390, "h": 72 },
+      "searchAndFilterBar": { "x": 16, "y": 124, "w": 358, "h": 44 },
+      "projectQuotaCard": { "x": 16, "y": 176, "w": 358, "h": 96 },
+      "photoStreamList": { "x": 16, "y": 284, "w": 358, "h": 480 },
+      "bottomNavigation": { "x": 0, "y": 764, "w": 390, "h": 80 }
+    },
+    "PurchaseActivity": {
+      "modeSwitcherTab": { "x": 45, "y": 56, "w": 300, "h": 40 },
+      "featureHeroCarousel": { "x": 16, "y": 112, "w": 358, "h": 260 },
+      "skuPricingCards": { "x": 16, "y": 388, "w": 358, "h": 260 },
+      "paymentCtaFooter": { "x": 16, "y": 664, "w": 358, "h": 120 }
+    }
+  },
+  "watermarkOfficialPresets": [
+    {
+      "id": "10011",
+      "codeName": "BLUE_REAL_TIME_OFFICIAL_WM_ID",
+      "title": "Real-Time Official Anti-Tamper Watermark",
+      "themeColor": "#2563EB",
+      "fields": ["ntpRealTime", "dateWeekday", "gpsCoordinatesDms", "streetAddress", "azimuthCompass", "weatherTemp", "projectNote", "antiFakeCode"]
+    },
+    {
+      "id": "57",
+      "codeName": "STEEL_DETECT_CV_WM_ID",
+      "title": "AI Construction Steel Rebar Counter",
+      "cvModelId": 4,
+      "themeColor": "#F59E0B",
+      "fields": ["autoSteelCount", "batchNumber", "inspectorName", "gpsAddress", "antiFakeCode"]
+    },
+    {
+      "id": "34",
+      "codeName": "ATTENDANCE_TIMECLOCK_WM_ID",
+      "title": "Geofence Shift Clock-In / Clock-Out",
+      "themeColor": "#10B981",
+      "fields": ["shiftTime", "employeeName", "geofenceStatus", "companyLogo", "antiFakeCode"]
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+# Ignore raw APK (>100MB GitHub limit) and raw JADX decompiled output (325MB)
+Timemark.apk
+decompiled/
+.ssh/
+
+# Ignore temporary CMake build directories
+**/build/
+**/build_*/
+.vs/
+.idea/
+*.TMP
+
