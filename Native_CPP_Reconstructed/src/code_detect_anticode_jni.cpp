@@ -512,9 +512,9 @@ Java_com_xhey_xcamerasdk_algorithm_nn_CodeDetect_imageEncode(
     }
     AndroidBitmap_unlockPixels(env, bitmap);
 
-    std::ostringstream oss;
-    oss << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << dhash;
-    return env->NewStringUTF(oss.str().c_str());
+    char hexBuf[17] = {0};
+    std::snprintf(hexBuf, sizeof(hexBuf), "%016llX", static_cast<unsigned long long>(dhash));
+    return env->NewStringUTF(hexBuf);
 }
 
 /**

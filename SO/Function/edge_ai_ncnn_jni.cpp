@@ -974,22 +974,51 @@ public:
             return -1;
         }
 
-        std::istringstream iss(text);
-        std::string line;
         int headerStep = 0;
+        size_t linePos = 0;
 
-        while (std::getline(iss, line)) {
-            while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ')) {
+        auto nextToken = [](const std::string& s, size_t& pos, std::string& tok) -> bool {
+            while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\r' || s[pos] == '\n')) {
+                ++pos;
+            }
+            if (pos >= s.size()) return false;
+            size_t start = pos;
+            while (pos < s.size() && s[pos] != ' ' && s[pos] != '\t' && s[pos] != '\r' && s[pos] != '\n') {
+                ++pos;
+            }
+            tok.assign(s, start, pos - start);
+            return true;
+        };
+
+        auto parseIntStrict = [](const std::string& tok, int& outVal) -> bool {
+            if (tok.empty()) return false;
+            char* endp = nullptr;
+            long v = std::strtol(tok.c_str(), &endp, 10);
+            if (!endp || *endp != '\0') return false;
+            outVal = static_cast<int>(v);
+            return true;
+        };
+
+        while (linePos < text.size()) {
+            size_t nl = text.find('\n', linePos);
+            std::string line = (nl == std::string::npos)
+                ? text.substr(linePos)
+                : text.substr(linePos, nl - linePos);
+            linePos = (nl == std::string::npos) ? text.size() : (nl + 1);
+
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ' || line.back() == '\t')) {
                 line.pop_back();
             }
             if (line.empty() || line[0] == '#') continue;
-            std::istringstream ls(line);
+            size_t tpos = 0;
+            std::string tok0, tok1, tok2, tok3;
             if (headerStep == 0) {
-                if (!(ls >> magic) || magic != 7767517) {
+                if (!nextToken(line, tpos, tok0) || !parseIntStrict(tok0, magic) || magic != 7767517) {
                     LOGE("NCNN parse_param_text failed: invalid header magic=%d", magic);
                     return -1;
                 }
-                if (ls >> expected_layers >> expected_blobs) {
+                if (nextToken(line, tpos, tok1) && nextToken(line, tpos, tok2) &&
+                    parseIntStrict(tok1, expected_layers) && parseIntStrict(tok2, expected_blobs)) {
                     if (expected_layers <= 0 || expected_blobs <= 0) {
                         LOGE("NCNN parse_param_text failed: invalid header counts layers=%d blobs=%d", expected_layers, expected_blobs);
                         return -1;
@@ -1001,7 +1030,9 @@ public:
                 continue;
             }
             if (headerStep == 1) {
-                if (!(ls >> expected_layers >> expected_blobs) || expected_layers <= 0 || expected_blobs <= 0) {
+                if (!nextToken(line, tpos, tok1) || !nextToken(line, tpos, tok2) ||
+                    !parseIntStrict(tok1, expected_layers) || !parseIntStrict(tok2, expected_blobs) ||
+                    expected_layers <= 0 || expected_blobs <= 0) {
                     LOGE("NCNN parse_param_text failed: invalid header counts layers=%d blobs=%d", expected_layers, expected_blobs);
                     return -1;
                 }
@@ -1011,23 +1042,30 @@ public:
             LayerNode node;
             int bottomCount = 0;
             int topCount = 0;
-            if (!(ls >> node.type >> node.name >> bottomCount >> topCount)) continue;
+            if (!nextToken(line, tpos, node.type) ||
+                !nextToken(line, tpos, node.name) ||
+                !nextToken(line, tpos, tok2) ||
+                !nextToken(line, tpos, tok3) ||
+                !parseIntStrict(tok2, bottomCount) ||
+                !parseIntStrict(tok3, topCount)) {
+                continue;
+            }
             if (bottomCount < 0 || bottomCount > 64 || topCount < 0 || topCount > 64) {
                 LOGE("NCNN parse_param_text failed: invalid blob counts in layer %s", node.name.c_str());
                 return -1;
             }
             for (int i = 0; i < bottomCount; ++i) {
                 std::string b;
-                if (!(ls >> b)) return -1;
+                if (!nextToken(line, tpos, b)) return -1;
                 node.bottoms.push_back(b);
             }
             for (int i = 0; i < topCount; ++i) {
                 std::string t;
-                if (!(ls >> t)) return -1;
+                if (!nextToken(line, tpos, t)) return -1;
                 node.tops.push_back(t);
             }
             std::string kv;
-            while (ls >> kv) {
+            while (nextToken(line, tpos, kv)) {
                 size_t eq = kv.find('=');
                 if (eq != std::string::npos) {
                     int k = std::atoi(kv.substr(0, eq).c_str());
@@ -1035,15 +1073,20 @@ public:
                     if (k <= -23300 || valStr.find(',') != std::string::npos) {
                         int arrId = (k <= -23300) ? (-23300 - k) : k;
                         std::vector<float> vals;
-                        std::istringstream vs(valStr);
-                        std::string item;
                         bool first = (k <= -23300);
-                        while (std::getline(vs, item, ',')) {
+                        size_t cpos = 0;
+                        while (cpos <= valStr.size()) {
+                            size_t comma = valStr.find(',', cpos);
+                            std::string item = (comma == std::string::npos)
+                                ? valStr.substr(cpos)
+                                : valStr.substr(cpos, comma - cpos);
                             if (first) {
                                 first = false;
-                                continue;
+                            } else if (!item.empty()) {
+                                vals.push_back(static_cast<float>(std::atof(item.c_str())));
                             }
-                            vals.push_back(static_cast<float>(std::atof(item.c_str())));
+                            if (comma == std::string::npos) break;
+                            cpos = comma + 1;
                         }
                         node.array_params[arrId] = std::move(vals);
                     } else {
@@ -2401,9 +2444,13 @@ static bool LoadPaddleDictionaryFile(const std::string& keysPath, std::vector<st
         content.erase(0, 3);
     }
 
-    std::istringstream iss(content);
-    std::string line;
-    while (std::getline(iss, line)) {
+    size_t lpos = 0;
+    while (lpos < content.size()) {
+        size_t nl = content.find('\n', lpos);
+        std::string line = (nl == std::string::npos)
+            ? content.substr(lpos)
+            : content.substr(lpos, nl - lpos);
+        lpos = (nl == std::string::npos) ? content.size() : (nl + 1);
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
             line.pop_back();
         }

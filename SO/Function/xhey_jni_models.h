@@ -229,12 +229,13 @@ inline uint32_t ComputeCrc32(const void* data, size_t len, uint32_t initCrc = 0u
 }
 
 inline std::string BytesToHex(const uint8_t* data, size_t len) {
-    std::ostringstream oss;
-    oss << std::hex << std::setfill('0');
+    static constexpr char kHex[17] = "0123456789abcdef";
+    std::string out(len * 2, '0');
     for (size_t i = 0; i < len; ++i) {
-        oss << std::setw(2) << static_cast<int>(data[i]);
+        out[i * 2]     = kHex[(data[i] >> 4) & 0x0F];
+        out[i * 2 + 1] = kHex[data[i] & 0x0F];
     }
-    return oss.str();
+    return out;
 }
 
 // ============================================================================

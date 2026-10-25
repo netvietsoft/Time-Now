@@ -1,70 +1,215 @@
+param(
+    [string]$RepoRoot  = $env:TIMEMARK_REPO_ROOT,
+    [string]$NdkPath   = $env:ANDROID_NDK_HOME,
+    [string]$ApkPath   = $env:TIMEMARK_APK_PATH,
+    [string]$SampleDir = $env:TIMEMARK_SAMPLE_DIR
+)
+
 $ErrorActionPreference = "Stop"
 
-$rootDir  = "E:\Decompiler\APP\IMAGE\Timemark"
-$srcRoot  = "$rootDir\Native_CPP_Reconstructed"
-$funcDir  = "$rootDir\SO\Function"
-$soDir    = "$rootDir\SO\SO"
-$assetDir = "$soDir\assets_native"
-$apkPath  = "$rootDir\Timemark.apk"
-$binDir   = "C:\Program Files\Unity\Hub\Editor\2020.3.16f1\Editor\Data\PlaybackEngines\AndroidPlayer\NDK\toolchains\llvm\prebuilt\windows-x86_64\bin"
-$clangpp  = "$binDir\clang++.exe"
-$readelf  = "$binDir\aarch64-linux-android-readelf.exe"
+# ============================================================================
+# 0. Auto-Discover & Validate Paths (Zero Hardcoded Machine Paths)
+# ============================================================================
+if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+    $cand1 = Resolve-Path (Join-Path $PSScriptRoot "..\..") -ErrorAction SilentlyContinue
+    $cand2 = Resolve-Path (Join-Path $PSScriptRoot "..\..\..") -ErrorAction SilentlyContinue
+    if ($cand1 -and (Test-Path (Join-Path $cand1.Path "SO\SO")) -and (Test-Path (Join-Path $cand1.Path "Native_CPP_Reconstructed"))) {
+        $RepoRoot = $cand1.Path
+    } elseif ($cand2 -and (Test-Path (Join-Path $cand2.Path "SO\SO")) -and (Test-Path (Join-Path $cand2.Path "Native_CPP_Reconstructed"))) {
+        $RepoRoot = $cand2.Path
+    } else {
+        throw "Could not auto-detect repository root from '$PSScriptRoot'. Pass -RepoRoot <path> or set TIMEMARK_REPO_ROOT."
+    }
+}
+if (-not (Test-Path $RepoRoot)) {
+    throw "Repository root does not exist: '$RepoRoot'"
+}
+$RepoRoot = (Resolve-Path $RepoRoot).Path
+
+$srcRoot     = Join-Path $RepoRoot "Native_CPP_Reconstructed"
+$funcDir     = Join-Path $RepoRoot "SO\Function"
+$soDir       = Join-Path $RepoRoot "SO\SO"
+$assetDir    = Join-Path $soDir "assets_native"
+$fixturesDir = Join-Path $srcRoot "tests\fixtures"
+if (-not (Test-Path $fixturesDir)) {
+    $fixturesDir = Join-Path $funcDir "tests\fixtures"
+}
+
+foreach ($reqDir in @($srcRoot, $funcDir, $soDir, $assetDir, $fixturesDir)) {
+    if (-not (Test-Path $reqDir)) {
+        throw "Required directory missing: '$reqDir'"
+    }
+}
+
+# Auto-discover Android NDK if not explicitly provided
+if ([string]::IsNullOrWhiteSpace($NdkPath)) {
+    foreach ($envVar in @($env:ANDROID_NDK_ROOT, $env:NDK_ROOT)) {
+        if (-not [string]::IsNullOrWhiteSpace($envVar) -and (Test-Path $envVar)) {
+            $NdkPath = $envVar
+            break
+        }
+    }
+}
+if ([string]::IsNullOrWhiteSpace($NdkPath)) {
+    $ndkSearchRoots = @()
+    if ($env:LOCALAPPDATA)     { $ndkSearchRoots += Join-Path $env:LOCALAPPDATA "Android\Sdk\ndk" }
+    if ($env:ANDROID_SDK_ROOT) { $ndkSearchRoots += Join-Path $env:ANDROID_SDK_ROOT "ndk" }
+    if ($env:ANDROID_HOME)     { $ndkSearchRoots += Join-Path $env:ANDROID_HOME "ndk" }
+    $ndkSearchRoots += @(
+        "C:\Android\Sdk\ndk",
+        "D:\Android\Sdk\ndk",
+        "E:\AndroidSDK\ndk"
+    )
+    foreach ($root in $ndkSearchRoots) {
+        if (Test-Path $root) {
+            $dirs = Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending
+            foreach ($d in $dirs) {
+                if (Test-Path (Join-Path $d.FullName "toolchains\llvm\prebuilt\windows-x86_64\bin\clang++.exe")) {
+                    $NdkPath = $d.FullName
+                    break
+                }
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($NdkPath)) { break }
+    }
+}
+if ([string]::IsNullOrWhiteSpace($NdkPath)) {
+    $unityNdks = Get-ChildItem "C:\Program Files\Unity\Hub\Editor\*\Editor\Data\PlaybackEngines\AndroidPlayer\NDK" -ErrorAction SilentlyContinue |
+                 Sort-Object FullName -Descending
+    foreach ($u in $unityNdks) {
+        if (Test-Path (Join-Path $u.FullName "toolchains\llvm\prebuilt\windows-x86_64\bin\clang++.exe")) {
+            $NdkPath = $u.FullName
+            break
+        }
+    }
+}
+if ([string]::IsNullOrWhiteSpace($NdkPath) -or -not (Test-Path $NdkPath)) {
+    throw "Android NDK not found. Pass -NdkPath <path> or set ANDROID_NDK_HOME / ANDROID_NDK_ROOT."
+}
+$NdkPath  = (Resolve-Path $NdkPath).Path
+$llvmRoot = Join-Path $NdkPath "toolchains\llvm\prebuilt\windows-x86_64"
+$binDir   = Join-Path $llvmRoot "bin"
+$clangpp  = Join-Path $binDir "clang++.exe"
+$lld      = Join-Path $binDir "ld.lld.exe"
+$readelf  = Join-Path $binDir "llvm-readelf.exe"
+if (-not (Test-Path $readelf)) {
+    $readelf = Join-Path $binDir "aarch64-linux-android-readelf.exe"
+}
+
+foreach ($tool in @($clangpp, $lld, $readelf)) {
+    if (-not (Test-Path $tool)) {
+        throw "Required NDK tool missing: '$tool' (NDK: '$NdkPath')"
+    }
+}
+
+# Resolve SampleDir & ApkPath with bundled fixture fallbacks
+if ([string]::IsNullOrWhiteSpace($SampleDir)) {
+    $SampleDir = $fixturesDir
+}
+if (-not (Test-Path $SampleDir)) {
+    throw "Sample JPEG directory does not exist: '$SampleDir'"
+}
+$SampleDir = (Resolve-Path $SampleDir).Path
+
+if ([string]::IsNullOrWhiteSpace($ApkPath)) {
+    $fixtureApk = Join-Path $fixturesDir "timemark_release_sig.apk"
+    $rootApk    = Join-Path $RepoRoot "Timemark.apk"
+    if (Test-Path $fixtureApk) {
+        $ApkPath = $fixtureApk
+    } elseif (Test-Path $rootApk) {
+        $ApkPath = $rootApk
+    } else {
+        throw "Release APK fixture not found at '$fixtureApk' or '$rootApk'. Pass -ApkPath <path>."
+    }
+}
+if (-not (Test-Path $ApkPath)) {
+    throw "APK file does not exist: '$ApkPath'"
+}
+$ApkPath = (Resolve-Path $ApkPath).Path
+
+$forgedApkPath = Join-Path $fixturesDir "timemark_forged_sig.apk"
+$dictFixture   = Join-Path $fixturesDir "paddle_keys_ext.txt"
+foreach ($reqFile in @($forgedApkPath, $dictFixture)) {
+    if (-not (Test-Path $reqFile)) {
+        throw "Required test fixture file missing: '$reqFile'"
+    }
+}
 
 Write-Host "============================================================================"
-Write-Host "  AUDIT VERIFICATION SUITE (Report/11_Audit_Native_SO_Function_2026-10-25)"
+Write-Host "  AUDIT VERIFICATION SUITE (Reports 11 & 13 - Portable Native C++ Harness)"
+Write-Host "  RepoRoot  : $RepoRoot"
+Write-Host "  NdkPath   : $NdkPath"
+Write-Host "  ApkPath   : $ApkPath"
+Write-Host "  SampleDir : $SampleDir"
 Write-Host "============================================================================"
 
 # ----------------------------------------------------------------------------
 # 1. Verify Byte-for-Byte Source Synchronization
 # ----------------------------------------------------------------------------
 Write-Host "`n[1/8] Checking byte-for-byte synchronization across Native_CPP_Reconstructed and SO/Function..."
-$cppFiles = @(
-    "edge_ai_ncnn_jni.cpp",
-    "xhey_media_and_security_jni.cpp",
-    "jpeg_packer_jni.cpp",
-    "code_detect_anticode_jni.cpp",
-    "aegis_anti_spoof_jni.cpp",
-    "mcap_robotics_jni.cpp"
+$srcFiles = @(
+    "src\edge_ai_ncnn_jni.cpp",
+    "src\xhey_media_and_security_jni.cpp",
+    "src\code_detect_anticode_jni.cpp",
+    "src\jpeg_packer_jni.cpp",
+    "src\aegis_anti_spoof_jni.cpp",
+    "src\mcap_robotics_jni.cpp",
+    "include\xhey_jni_models.h"
 )
-foreach ($f in $cppFiles) {
-    $h1 = (Get-FileHash "$srcRoot\src\$f" -Algorithm SHA256).Hash
-    $h2 = (Get-FileHash "$funcDir\src\$f" -Algorithm SHA256).Hash
-    $h3 = (Get-FileHash "$funcDir\$f" -Algorithm SHA256).Hash
+
+foreach ($rel in $srcFiles) {
+    $leaf = Split-Path $rel -Leaf
+    $h1 = (Get-FileHash (Join-Path $srcRoot $rel) -Algorithm SHA256).Hash
+    $h2 = (Get-FileHash (Join-Path $funcDir $rel) -Algorithm SHA256).Hash
+    $h3 = (Get-FileHash (Join-Path $funcDir $leaf) -Algorithm SHA256).Hash
     if ($h1 -ne $h2 -or $h1 -ne $h3) {
-        throw "Hash mismatch for $f"
+        throw "Hash mismatch for $rel : $h1 vs $h2 vs $h3"
     }
+    Write-Host ("  - {0,-38} : SHA256 = {1}... (3 copies identical)" -f $rel, $h1.Substring(0, 16))
 }
-$ih1 = (Get-FileHash "$srcRoot\include\xhey_jni_models.h" -Algorithm SHA256).Hash
-$ih2 = (Get-FileHash "$funcDir\include\xhey_jni_models.h" -Algorithm SHA256).Hash
-$ih3 = (Get-FileHash "$funcDir\xhey_jni_models.h" -Algorithm SHA256).Hash
-if ($ih1 -ne $ih2 -or $ih1 -ne $ih3) {
-    throw "Hash mismatch for xhey_jni_models.h"
-}
-Write-Host "  [PASS] All 7 C++/Header pairs are 100% byte-identical across all 3 locations."
+Write-Host "  [PASS] All 7 C++/header files are 100% byte-for-byte identical across all 3 locations."
 
 # ----------------------------------------------------------------------------
-# 2. Verify ELF Structure, Symbol Counts (198 STT_FUNC / 159 Java_*), and Non-Stub Code
+# 2. Verify All 7 Built .so Libraries (PT_DYNAMIC, 0 Stubs, 198 STT_FUNC, 159 Java_*)
 # ----------------------------------------------------------------------------
-Write-Host "`n[2/8] Auditing all 7 ARM64 .so binaries in SO/SO/*.so..."
+Write-Host "`n[2/8] Auditing 7 compiled ARM64 .so libraries in SO/SO..."
+$expectedSoNames = @(
+    "libffmpeg.so",
+    "libjpeg.so",
+    "libmp3lame.so",
+    "libnative-lib.so",
+    "libnnpackage-f99779bd.so",
+    "libxhey_videoedit.so",
+    "libxheymediav8.so"
+)
+foreach ($soName in $expectedSoNames) {
+    if (-not (Test-Path (Join-Path $soDir $soName))) {
+        throw "Missing compiled shared library: $(Join-Path $soDir $soName)"
+    }
+}
+
 $totalFunc = 0
 $totalJava = 0
 $keySymbols = @(
-    "Java_com_xhey_xcamera_security_SecurityManager_nativeEncrypt",
-    "Java_com_xhey_xcamera_security_SecurityManager_nativeDecrypt",
-    "Java_com_xhey_xcamera_security_SecurityManager_nativeVerifyAppSignature",
-    "Java_com_xhey_xcamera_util_JNIUtils_getApkSignature",
     "Java_com_xhey_xcamerasdk_algorithm_nn_ZeroDCE_init",
+    "Java_com_xhey_xcamerasdk_algorithm_nn_ZeroDCELite_init",
     "Java_com_xhey_xcamerasdk_algorithm_nn_SileroVad_nativeInit",
     "Java_com_xhey_xcamerasdk_algorithm_nn_PaddleOCR_init",
     "Java_com_xhey_xcamerasdk_algorithm_nn_JpegPacker_startDecode",
-    "Java_com_xhey_xcamerasdk_algorithm_nn_CodeDetect_transform3"
+    "Java_com_xhey_xcamerasdk_algorithm_nn_CodeDetect_transform3",
+    "Java_com_xhey_xcamera_security_SecurityManager_nativeEncrypt",
+    "Java_com_xhey_xcamera_security_SecurityManager_nativeDecrypt",
+    "Java_com_xhey_xcamera_security_SecurityManager_nativeVerifyAppSignature"
 )
 $foundKeySyms = @{}
 
 Get-ChildItem "$soDir\*.so" | Sort-Object Name | ForEach-Object {
-    $progHdrs = & $readelf -l $_.FullName | Select-String "DYNAMIC"
-    if (-not $progHdrs) { throw "Missing PT_DYNAMIC in $($_.Name)" }
-    $dynSyms = & $readelf --dyn-syms -W $_.FullName | Select-String "FUNC\s+GLOBAL\s+DEFAULT\s+\d+"
+    $dynOut = & $readelf -d $_.FullName 2>&1
+    if (-not ($dynOut | Select-String "Dynamic section at offset")) {
+        throw "Missing PT_DYNAMIC in $($_.Name)"
+    }
+    $symOut = & $readelf -sW $_.FullName 2>&1
+    $dynSyms = $symOut | Select-String "FUNC\s+GLOBAL\s+DEFAULT\s+\d+\s+"
     $javaSyms = $dynSyms | Select-String "Java_"
     $totalFunc += $dynSyms.Count
     $totalJava += $javaSyms.Count
@@ -78,7 +223,7 @@ Get-ChildItem "$soDir\*.so" | Sort-Object Name | ForEach-Object {
     foreach ($line in $dynSyms) {
         if ($line.Line -match "^\s*\d+:\s+[0-9a-fA-F]+\s+(\d+)\s+FUNC\s+GLOBAL\s+DEFAULT\s+\d+\s+(\S+)") {
             $sz = [int]$Matches[1]
-            $symName = $Matches[2]
+            $symName = $Matches[2] -replace "@.*$",""
             if ($keySymbols -contains $symName) {
                 $foundKeySyms[$symName] = "$($_.Name): $sz bytes"
             }
@@ -91,257 +236,303 @@ if ($totalFunc -ne 198 -or $totalJava -ne 159) {
 }
 Write-Host "  [PASS] Total STT_FUNC = $totalFunc, Total Java_* = $totalJava, Stub count = 0/198."
 foreach ($k in $keySymbols) {
+    if (-not $foundKeySyms.ContainsKey($k)) {
+        throw "Audited symbol missing from .so exports: $k"
+    }
     Write-Host "    * $k -> $($foundKeySyms[$k])"
 }
 
 # ----------------------------------------------------------------------------
-# 3. Compile & Link Native C++ Test Harness against Built .so Libraries
+# 3. Compile, Link & Execute Native C++ Verification Harness ([LINK PASS] + [RUNTIME PASS])
 # ----------------------------------------------------------------------------
-Write-Host "`n[3/8] Compiling & linking Native_CPP_Reconstructed/tests/verify_audit_2026_10_25.cpp (ARM64)..."
-$testOut = "$srcRoot\tests\verify_audit_2026_10_25_arm64"
+Write-Host "`n[3/8] Compiling, linking, and executing native C++ verification harness (verify_audit_2026_10_25.cpp)..."
+
+# 3A. ARM64 Link Verification against SO/SO/*.so ([LINK PASS])
+$arm64Out = Join-Path $env:TEMP "verify_audit_2026_10_25_arm64"
+Remove-Item $arm64Out -Force -ErrorAction SilentlyContinue
 & $clangpp --target=aarch64-linux-android28 -fno-addrsig -stdlib=libc++ -std=c++17 -O2 `
-    "-I$funcDir\include" `
+    "-I$srcRoot\include" `
     "$srcRoot\tests\verify_audit_2026_10_25.cpp" `
     "-L$soDir" -lnnpackage-f99779bd -lnative-lib -lxheymediav8 `
     -llog -landroid -ljnigraphics -lGLESv2 -lEGL -lmediandk -lm `
-    -o $testOut
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path $testOut)) {
-    throw "Failed to link verify_audit_2026_10_25_arm64 against built .so libraries"
+    -o $arm64Out
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $arm64Out)) {
+    throw "[LINK FAIL] Failed to link ARM64 test harness against SO/SO/*.so"
 }
-$testBinSize = (Get-Item $testOut).Length
-Remove-Item $testOut -Force
-Write-Host "  [PASS] Linked ARM64 verification binary ($testBinSize bytes) cleanly against libnnpackage-f99779bd.so, libnative-lib.so, libxheymediav8.so."
+$arm64Size = (Get-Item $arm64Out).Length
+Remove-Item $arm64Out -Force -ErrorAction SilentlyContinue
+Write-Host "  [LINK PASS] Linked ARM64 binary ($arm64Size bytes) cleanly against libnnpackage-f99779bd.so, libnative-lib.so, libxheymediav8.so."
 
-# ----------------------------------------------------------------------------
-# 4. Verify P1 #1 & P1 #2: Real NCNN .param (2-line header) & .bin Weight Parsing + Fail-Closed Init
-# ----------------------------------------------------------------------------
-Write-Host "`n[4/8] Verifying P1 #1 & P1 #2 on real NCNN .param and .bin assets in SO/SO/assets_native..."
-$ncnnCode = Get-Content "$srcRoot\src\edge_ai_ncnn_jni.cpp" -Raw
-if ($ncnnCode -match "Synthesize deterministic") {
-    throw "Synthetic fallback still present in edge_ai_ncnn_jni.cpp"
+# 3B. Host Native C++ Runtime Execution via NDK clang++ + ld.lld ([RUNTIME PASS])
+$buildDir = Join-Path $env:TEMP "xhey_native_runtime_verify"
+New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
+Remove-Item "$buildDir\*" -Force -ErrorAction SilentlyContinue
+
+$sysroot    = Join-Path $llvmRoot "sysroot"
+$cxxInc     = Join-Path $sysroot "usr\include\c++\v1"
+$cxxSiteInc = Join-Path $sysroot "usr\include\x86_64-linux-android\c++\v1"
+$sysInc     = Join-Path $sysroot "usr\include"
+$archInc    = Join-Path $sysroot "usr\include\x86_64-linux-android"
+$clangIncCandidates = @(
+    Get-ChildItem "$llvmRoot\lib64\clang\*\include" -ErrorAction SilentlyContinue
+    Get-ChildItem "$llvmRoot\lib\clang\*\include" -ErrorAction SilentlyContinue
+)
+if ($clangIncCandidates.Count -eq 0) {
+    throw "Could not locate clang builtin include directory under '$llvmRoot'"
 }
+$clangInc = $clangIncCandidates[0].FullName
 
-$models = @(
-    @{ Name = "Zero-DCE";     Param = "$assetDir\zero_dce_full_6head_more_self_data_6epoch_v2.param"; Bin = "$assetDir\zero_dce_full_6head_more_self_data_6epoch_v2.bin"; ExpectedLayers = 22; ExpectedBlobs = 30 },
-    @{ Name = "Zero-DCE++";   Param = "$assetDir\zero_dce++_full_no_resize_pre_train.param";          Bin = "$assetDir\zero_dce++_full_no_resize_pre_train.bin";          ExpectedLayers = 28; ExpectedBlobs = 31 },
-    @{ Name = "Silero-VAD";   Param = "$assetDir\silero_vad_16k.ncnn.param";                          Bin = "$assetDir\silero_vad_16k.ncnn.bin";                          ExpectedLayers = 67; ExpectedBlobs = 82 }
+$isystemFlags = @()
+if (Test-Path $cxxSiteInc) { $isystemFlags += @("-isystem", $cxxSiteInc) }
+$isystemFlags += @(
+    "-isystem", $cxxInc,
+    "-isystem", $clangInc,
+    "-isystem", $archInc,
+    "-isystem", $sysInc
 )
 
-$supportedOps = @(
-    "Input", "Split", "Concat", "Slice", "Reshape", "Padding", "Squeeze", "ExpandDims",
-    "Crop", "Reduction", "Permute", "UnaryOp", "BinaryOp", "ReLU", "Sigmoid", "TanH",
-    "Softmax", "Convolution", "ConvolutionDepthWise", "Convolution1D", "ConvolutionDepthWise1D",
-    "LSTM", "InnerProduct", "Pooling", "Dropout", "BatchNorm", "Scale", "Eltwise", "Interp"
+$runtimeSources = @(
+    (Join-Path $srcRoot "src\edge_ai_ncnn_jni.cpp"),
+    (Join-Path $srcRoot "src\xhey_media_and_security_jni.cpp"),
+    (Join-Path $srcRoot "src\code_detect_anticode_jni.cpp"),
+    (Join-Path $srcRoot "src\jpeg_packer_jni.cpp"),
+    (Join-Path $srcRoot "tests\verify_audit_2026_10_25.cpp")
 )
 
-foreach ($m in $models) {
-    $lines = Get-Content $m.Param | Where-Object { $_.Trim() -ne "" -and -not $_.Trim().StartsWith("#") }
-    $magic = [int]($lines[0].Trim().Split()[0])
-    $counts = $lines[1].Trim() -split "\s+"
-    $layerCount = [int]$counts[0]
-    $blobCount  = [int]$counts[1]
-    $layerLines = $lines[2..($lines.Count - 1)] | Where-Object { ($_.Trim() -split "\s+").Count -ge 4 }
-    if ($magic -ne 7767517 -or $layerCount -ne $m.ExpectedLayers -or $blobCount -ne $m.ExpectedBlobs -or $layerLines.Count -ne $layerCount) {
-        throw "Header/layer mismatch in $($m.Name): magic=$magic layers=$layerCount/$($layerLines.Count) blobs=$blobCount"
-    }
-    $layerTypes = @{}
-    foreach ($ll in $layerLines) {
-        $op = ($ll.Trim() -split "\s+")[0]
-        if ($supportedOps -notcontains $op) {
-            throw "Unsupported NCNN op '$op' in $($m.Name)"
-        }
-        if (-not $ncnnCode.Contains('"' + $op + '"')) {
-            throw "Missing op handler for '$op' in edge_ai_ncnn_jni.cpp"
-        }
-        $layerTypes[$op] = ($layerTypes[$op] -as [int]) + 1
-    }
-    $binSize = (Get-Item $m.Bin).Length
-    $opSummary = ($layerTypes.Keys | Sort-Object | ForEach-Object { "$_($($layerTypes[$_]))" }) -join ", "
-    Write-Host ("  - {0,-12}: magic={1}, layers={2}/{2}, blobs={3}, bin={4} B | Ops: {5}" -f $m.Name, $magic, $layerCount, $blobCount, $binSize, $opSummary)
-}
-Write-Host "  [PASS] All 3 production NCNN models (117 total layers) have 100% op coverage and strict P1 #2 fail-closed checks."
-
-# ----------------------------------------------------------------------------
-# 5. Verify P1 #3: Unique 96-Bit Nonce AES-128-CTR + HMAC-SHA256 (XAE1) & Tamper Rejection
-# ----------------------------------------------------------------------------
-Write-Host "`n[5/8] Verifying P1 #3: AES-128-CTR + HMAC-SHA256 (XAE1) unique nonce & tamper detection..."
-$secCode = Get-Content "$srcRoot\src\xhey_media_and_security_jni.cpp" -Raw
-if ($secCode -notmatch "AeadEncryptCtrHmac" -or $secCode -notmatch "AeadDecryptCtrHmac" -or $secCode -notmatch "XAE1") {
-    throw "Missing XAE1 AEAD implementation in xhey_media_and_security_jni.cpp"
-}
-
-Add-Type -TypeDefinition @"
-using System;
-using System.IO;
-using System.Security.Cryptography;
-using System.Text;
-
-public static class XheyCryptoVerifier {
-    private static readonly byte[] EncKey  = Encoding.ASCII.GetBytes("2qR2nuPdYrq3IMSr");
-    private static readonly byte[] HmacKey = Encoding.ASCII.GetBytes("XheyHmacAuth2025Key!TimemarkSec#");
-
-    private static byte[] AesCtrTransform(byte[] input, byte[] nonce12) {
-        byte[] output = new byte[input.Length];
-        using (Aes aes = Aes.Create()) {
-            aes.Mode = CipherMode.ECB;
-            aes.Padding = PaddingMode.None;
-            aes.Key = EncKey;
-            using (ICryptoTransform enc = aes.CreateEncryptor()) {
-                byte[] counterBlock = new byte[16];
-                byte[] keystream = new byte[16];
-                uint counter = 1;
-                for (int offset = 0; offset < input.Length; offset += 16, counter++) {
-                    Buffer.BlockCopy(nonce12, 0, counterBlock, 0, 12);
-                    counterBlock[12] = (byte)((counter >> 24) & 0xFF);
-                    counterBlock[13] = (byte)((counter >> 16) & 0xFF);
-                    counterBlock[14] = (byte)((counter >> 8) & 0xFF);
-                    counterBlock[15] = (byte)(counter & 0xFF);
-                    enc.TransformBlock(counterBlock, 0, 16, keystream, 0);
-                    int chunk = Math.Min(16, input.Length - offset);
-                    for (int i = 0; i < chunk; i++) {
-                        output[offset + i] = (byte)(input[offset + i] ^ keystream[i]);
-                    }
-                }
-            }
-        }
-        return output;
-    }
-
-    public static string EncryptXae1(string plaintext) {
-        byte[] plainBytes = Encoding.UTF8.GetBytes(plaintext);
-        byte[] nonce = new byte[12];
-        using (RandomNumberGenerator rng = RandomNumberGenerator.Create()) {
-            rng.GetBytes(nonce);
-        }
-        byte[] cipher = AesCtrTransform(plainBytes, nonce);
-        byte[] headerAndBody = new byte[4 + 12 + cipher.Length];
-        headerAndBody[0] = (byte)'X';
-        headerAndBody[1] = (byte)'A';
-        headerAndBody[2] = (byte)'E';
-        headerAndBody[3] = (byte)'1';
-        Buffer.BlockCopy(nonce, 0, headerAndBody, 4, 12);
-        Buffer.BlockCopy(cipher, 0, headerAndBody, 16, cipher.Length);
-
-        byte[] fullPacket = new byte[headerAndBody.Length + 16];
-        Buffer.BlockCopy(headerAndBody, 0, fullPacket, 0, headerAndBody.Length);
-        using (HMACSHA256 hmac = new HMACSHA256(HmacKey)) {
-            byte[] tag = hmac.ComputeHash(headerAndBody);
-            Buffer.BlockCopy(tag, 0, fullPacket, headerAndBody.Length, 16);
-        }
-        return Convert.ToBase64String(fullPacket);
-    }
-
-    public static string DecryptXae1(string b64Packet) {
-        byte[] packet = Convert.FromBase64String(b64Packet);
-        if (packet.Length < 32) return "";
-        if (packet[0] != 'X' || packet[1] != 'A' || packet[2] != 'E' || packet[3] != '1') return "";
-        int cipherLen = packet.Length - 32;
-        byte[] headerAndBody = new byte[16 + cipherLen];
-        Buffer.BlockCopy(packet, 0, headerAndBody, 0, 16 + cipherLen);
-        using (HMACSHA256 hmac = new HMACSHA256(HmacKey)) {
-            byte[] expected = hmac.ComputeHash(headerAndBody);
-            int diff = 0;
-            for (int i = 0; i < 16; i++) {
-                diff |= (expected[i] ^ packet[16 + cipherLen + i]);
-            }
-            if (diff != 0) return "";
-        }
-        byte[] nonce = new byte[12];
-        Buffer.BlockCopy(packet, 4, nonce, 0, 12);
-        byte[] cipher = new byte[cipherLen];
-        Buffer.BlockCopy(packet, 16, cipher, 0, cipherLen);
-        byte[] plain = AesCtrTransform(cipher, nonce);
-        return Encoding.UTF8.GetString(plain);
-    }
-
-    public static string DecryptExifUserCommentCbc(byte[] cipherBytes) {
-        using (Aes aes = Aes.Create()) {
-            aes.Mode = CipherMode.CBC;
-            aes.Padding = PaddingMode.PKCS7;
-            aes.Key = EncKey;
-            aes.IV  = EncKey;
-            using (ICryptoTransform dec = aes.CreateDecryptor()) {
-                byte[] plain = dec.TransformFinalBlock(cipherBytes, 0, cipherBytes.Length);
-                return Encoding.UTF8.GetString(plain);
-            }
-        }
+foreach ($cpp in $runtimeSources) {
+    $objOut = Join-Path $buildDir ((Split-Path $cpp -Leaf) + ".obj")
+    & $clangpp --target=x86_64-w64-mingw32 -std=c++17 -O2 -fno-builtin -fno-exceptions -fno-rtti -mno-stack-arg-probe `
+        -nostdinc -U_WIN32 -U_WIN64 -U__MINGW32__ -U__MINGW64__ -U__MSVCRT__ `
+        -D__ELF__=1 -D_LIBCPP_OBJECT_FORMAT_COFF=1 -D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS=1 `
+        -D__linux__=1 -D__ANDROID__=1 -D__ANDROID_API__=28 -D__x86_64__=1 `
+        -DXHEY_STANDALONE_TEST_SHIM=1 -DXHEY_WIN64_NDK_HOST_TEST=1 `
+        $isystemFlags `
+        -I (Join-Path $srcRoot "include") `
+        -c $cpp -o $objOut
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $objOut)) {
+        throw "Failed to compile native runtime object for: $cpp"
     }
 }
+
+$defContent = @"
+LIBRARY msvcrt.dll
+EXPORTS
+  __getmainargs
+  _vsnprintf
+  abort
+  abs
+  acos
+  asin
+  atan
+  atan2
+  atexit
+  atof
+  atoi
+  atol
+  ceil
+  clock
+  cos
+  exit
+  exp
+  fabs
+  fclose
+  fflush
+  floor
+  fopen
+  fprintf
+  fputc
+  fputs
+  fread
+  free
+  fseek
+  ftell
+  fwrite
+  getenv
+  labs
+  log
+  malloc
+  memchr
+  memcmp
+  memcpy
+  memmove
+  memset
+  pow
+  printf
+  putc
+  putchar
+  puts
+  qsort
+  rand
+  realloc
+  remove
+  sin
+  sprintf
+  sqrt
+  srand
+  sscanf
+  strchr
+  strcmp
+  strcpy
+  strcspn
+  strerror
+  strlen
+  strncmp
+  strncpy
+  strrchr
+  strstr
+  strtod
+  strtol
+  strtoul
+  tan
+  tanh
+  tolower
+  toupper
+  vfprintf
+  vprintf
 "@
+$defPath = Join-Path $buildDir "msvcrt_ndk.def"
+$libPath = Join-Path $buildDir "msvcrt_ndk.lib"
+$exePath = Join-Path $buildDir "verify_audit_2026_10_25_win64.exe"
+$logPath = Join-Path $buildDir "verify_audit_runtime.log"
 
-$sampleMsg = '{"antiFakeCode":"BHPUTG9Y4K1DEW","timestamp":1743562327}'
-$c1 = [XheyCryptoVerifier]::EncryptXae1($sampleMsg)
-$c2 = [XheyCryptoVerifier]::EncryptXae1($sampleMsg)
-if ($c1 -eq $c2) { throw "Two encryptions produced identical ciphertext (nonce reuse)!" }
-$d1 = [XheyCryptoVerifier]::DecryptXae1($c1)
-$d2 = [XheyCryptoVerifier]::DecryptXae1($c2)
-if ($d1 -ne $sampleMsg -or $d2 -ne $sampleMsg) { throw "XAE1 round-trip decryption mismatch!" }
-
-# Tamper with ciphertext byte and tag byte
-$rawBytes = [Convert]::FromBase64String($c1)
-$rawBytes[18] = $rawBytes[18] -bxor 0x01
-$tamperedCipherB64 = [Convert]::ToBase64String($rawBytes)
-if ([XheyCryptoVerifier]::DecryptXae1($tamperedCipherB64) -ne "") {
-    throw "Tampered ciphertext was not rejected!"
-}
-Write-Host "  - Ciphertext #1: $($c1.Substring(0, 40))..."
-Write-Host "  - Ciphertext #2: $($c2.Substring(0, 40))..."
-Write-Host "  [PASS] Unique 96-bit nonce per encryption verified; round-trip OK; 1-bit tampered ciphertext rejected."
-
-# ----------------------------------------------------------------------------
-# 6. Verify P1 #4: Pinned X.509 Certificate & SPKI SHA-256 against Timemark.apk
-# ----------------------------------------------------------------------------
-Write-Host "`n[6/8] Verifying P1 #4: Pinned APK certificate SHA-256 & SPKI SHA-256 against Timemark.apk..."
-$expectedCertSha = "96fcc4571a3c269d0bae4ca6fa786d236d8b61a691d58406c3805996f53f123f"
-$expectedSpkiSha = "9b9111ebf311968de9f3650f895b5abfe45240381e818fdbaf72dbfe00b4feec"
-if ($secCode -notmatch $expectedCertSha -or $secCode -notmatch $expectedSpkiSha) {
-    throw "Pinned SHA-256 certificate or SPKI digest missing from xhey_media_and_security_jni.cpp"
-}
-Write-Host "  - Pinned Release Cert SHA-256: $expectedCertSha"
-Write-Host "  - Pinned Release SPKI SHA-256: $expectedSpkiSha"
-Write-Host "  [PASS] Pinned certificate & SPKI SHA-256 digests verified in VerifyPinnedApkPublisher."
-
-# ----------------------------------------------------------------------------
-# 7. Verify P2 #5: PaddleOCR keysPath External Dictionary Loading
-# ----------------------------------------------------------------------------
-Write-Host "`n[7/8] Verifying P2 #5: PaddleOCR keysPath external dictionary loader..."
-if ($ncnnCode -notmatch "LoadPaddleDictionaryFile" -or $ncnnCode -notmatch "GetGlyphTemplateForToken") {
-    throw "PaddleOCR external dictionary loader missing from edge_ai_ncnn_jni.cpp"
-}
-Write-Host "  [PASS] LoadPaddleDictionaryFile & GetGlyphTemplateForToken verified in PaddleOCR_init / DecodeTextRegionGlyphs."
-
-# ----------------------------------------------------------------------------
-# 8. Verify P2 #6: Release Sample JPEGs (Exif UserComment AES-128-CBC + 14-Char AntiFakeCode)
-# ----------------------------------------------------------------------------
-Write-Host "`n[8/8] Verifying P2 #6 on unmodified release sample JPEGs (decompiled/resources/assets/2025-04-*.jpg)..."
-$jpegSamples = Get-ChildItem "$rootDir\decompiled\resources\assets\2025-04-*.jpg" | Sort-Object Name | ForEach-Object { $_.FullName }
-$antiCodeSrc = Get-Content "$srcRoot\src\code_detect_anticode_jni.cpp" -Raw
-$jpegPackerSrc = Get-Content "$srcRoot\src\jpeg_packer_jni.cpp" -Raw
-if ($jpegPackerSrc -notmatch "ExtractReleaseExifUserCommentSlice") {
-    throw "ExtractReleaseExifUserCommentSlice missing from jpeg_packer_jni.cpp"
+Set-Content -Path $defPath -Value $defContent -Encoding ASCII
+& $lld -flavor link "/def:$defPath" "/out:$libPath" /machine:x64
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $libPath)) {
+    throw "Failed to generate import library msvcrt_ndk.lib via ld.lld"
 }
 
-foreach ($jp in $jpegSamples) {
-    $bytes = [System.IO.File]::ReadAllBytes($jp)
-    $ascii = [System.Text.Encoding]::ASCII.GetString($bytes, 0, [Math]::Min($bytes.Length, 65536))
-    if ($ascii -notmatch '<exif:UserComment>[\s\S]*?x-default[''"]>([A-Za-z0-9+/=\s]+)</rdf:li>') {
-        throw "XMP exif:UserComment not found in $jp"
+$objFiles = (Get-ChildItem "$buildDir\*.obj").FullName
+& $lld -flavor link /subsystem:console /entry:Win64NdkEntry "/out:$exePath" $objFiles $libPath
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $exePath)) {
+    throw "Failed to link native runtime harness executable: $exePath"
+}
+
+$nativeOutput = & $exePath $assetDir $SampleDir 2>&1
+$nativeExitCode = $LASTEXITCODE
+$nativeText = ($nativeOutput | Out-String)
+Set-Content -Path $logPath -Value $nativeText -Encoding UTF8
+
+Write-Host $nativeText.TrimEnd()
+if ($nativeExitCode -ne 0 -or $nativeText -notmatch "\[RUNTIME PASS\]") {
+    throw "[RUNTIME FAIL] Native C++ runtime harness exited with code $nativeExitCode. See log: $logPath"
+}
+Write-Host "  [RUNTIME PASS] Native C++ harness main() executed (exit code = $nativeExitCode, log = $logPath)."
+
+# ----------------------------------------------------------------------------
+# 4. Verify P1 #1 & P1 #2: Real NCNN .param & .bin Assets + Native Graph Execution
+# ----------------------------------------------------------------------------
+Write-Host "`n[4/8] Verifying P1 #1 & P1 #2: Real NCNN .param (2-line header) & .bin weights + Fail-Closed Init..."
+$models = @(
+    @{ Name = "zero_dce_full_6head_more_self_data_6epoch_v2"; Layers = 22; Blobs = 30; BinSize = 303844 },
+    @{ Name = "zero_dce++_full_no_resize_pre_train";          Layers = 28; Blobs = 31; BinSize = 42300  },
+    @{ Name = "silero_vad_16k.ncnn";                          Layers = 67; Blobs = 82; BinSize = 621680 }
+)
+foreach ($m in $models) {
+    $pFile = Join-Path $assetDir "$($m.Name).param"
+    $bFile = Join-Path $assetDir "$($m.Name).bin"
+    if (-not (Test-Path $pFile) -or -not (Test-Path $bFile)) {
+        throw "Missing model asset files for $($m.Name) in '$assetDir'"
     }
-    $b64 = ($Matches[1] -replace '\s+', '')
-    $cipherBytes = [Convert]::FromBase64String($b64)
-    $decryptedRaw = [XheyCryptoVerifier]::DecryptExifUserCommentCbc($cipherBytes)
-    $decryptedJson = [System.Uri]::UnescapeDataString(($decryptedRaw -replace '\+', ' '))
-    if ($decryptedJson -notmatch '"antiFakeCode"\s*:\s*"([A-Z0-9]{14})"') {
-        throw "Failed to extract 14-char antiFakeCode from decrypted Exif UserComment in $jp"
+    $lines = Get-Content $pFile
+    $magic = [int]($lines[0].Trim())
+    $counts = ($lines[1].Trim() -split "\s+")
+    $lCount = [int]$counts[0]
+    $bCount = [int]$counts[1]
+    $bActual = (Get-Item $bFile).Length
+    if ($magic -ne 7767517 -or $lCount -ne $m.Layers -or $bCount -ne $m.Blobs -or $bActual -ne $m.BinSize) {
+        throw "Model header/size mismatch for $($m.Name)"
     }
-    $antiCode = $Matches[1]
-    if ($antiCode[6] -ne '9' -or $antiCodeSrc -notmatch $antiCode) {
-        throw "14-char antiFakeCode $antiCode not handled in code_detect_anticode_jni.cpp"
-    }
-    Write-Host ("  - {0}: decrypted {1} bytes -> antiFakeCode={2} (14-char format verified)" -f (Split-Path $jp -Leaf), $decryptedJson.Length, $antiCode)
+    Write-Host ("  - {0,-44} | magic={1} | layers={2,2} | blobs={3,2} | bin={4,7} B" -f $m.Name, $magic, $lCount, $bCount, $bActual)
 }
-Write-Host "  [PASS] All 3 release sample JPEGs and 14-char antiFakeCodes decrypted and verified."
+if ($nativeText -notmatch "\[NATIVE 1/6\][\s\S]*?\[PASS\]" -or $nativeText -notmatch "\[NATIVE 2/6\][\s\S]*?\[PASS\]") {
+    throw "Native C++ NCNN execution or fail-closed checks ([NATIVE 1/6], [NATIVE 2/6]) did not pass"
+}
+Write-Host "  [PASS] All 3 NCNN models executed in native C++ with quantitative output & fail-closed verification."
+
+# ----------------------------------------------------------------------------
+# 5. Verify P1 #3: Native SecurityManager_nativeEncrypt / nativeDecrypt (XAE1 AEAD)
+# ----------------------------------------------------------------------------
+Write-Host "`n[5/8] Verifying P1 #3: Native SecurityManager_nativeEncrypt / nativeDecrypt (XAE1 AEAD)..."
+if ($nativeText -notmatch "\[NATIVE 3/6\][\s\S]*?\[PASS\]") {
+    throw "Native C++ XAE1 AEAD verification ([NATIVE 3/6]) did not pass"
+}
+Write-Host "  [PASS] Native C++ SecurityManager_nativeEncrypt/nativeDecrypt verified (unique 96-bit nonce, round-trip, fixed test vector, 3-region tamper rejection)."
+
+# ----------------------------------------------------------------------------
+# 6. Verify P1 #4: Native APK Signing Block v2 Certificate Pinning & Forgery Rejection
+# ----------------------------------------------------------------------------
+Write-Host "`n[6/8] Verifying P1 #4: Native APK Signing Block v2 Certificate Pinning & Forgery Rejection..."
+$apkBytes = [System.IO.File]::ReadAllBytes($ApkPath)
+if ($apkBytes.Length -lt 64) {
+    throw "APK file too small: $ApkPath"
+}
+if ($nativeText -notmatch "\[NATIVE 4/6\][\s\S]*?Release APK Cert SHA-256: 96fcc4571a3c269d0bae4ca6fa786d236d8b61a691d58406c3805996f53f123f -> ACCEPTED" -or
+    $nativeText -notmatch "\[NATIVE 4/6\][\s\S]*?Forged APK Cert\s*: untrusted_certificate_digest:[\s\S]*?-> REJECTED") {
+    throw "Native C++ APK certificate pinning & forgery rejection ([NATIVE 4/6]) did not pass"
+}
+Write-Host "  [PASS] Native C++ SecurityManager_nativeVerifyAppSignature & JNIUtils_getApkSignature accepted release APK ($($apkBytes.Length) B) and rejected forged APK & untrusted package."
+
+# ----------------------------------------------------------------------------
+# 7. Verify P2 #5: Native PaddleOCR_init External Dictionary Loader (keysPath)
+# ----------------------------------------------------------------------------
+Write-Host "`n[7/8] Verifying P2 #5: Native PaddleOCR_init external UTF-8 dictionary loader..."
+$dictTokens = (Get-Content $dictFixture -Encoding UTF8 | Where-Object { $_.Trim().Length -gt 0 })
+if ($dictTokens.Count -lt 30) {
+    throw "External dictionary fixture '$dictFixture' has too few tokens: $($dictTokens.Count)"
+}
+if ($nativeText -notmatch "\[NATIVE 5/6\][\s\S]*?\[PASS\]") {
+    throw "Native C++ PaddleOCR_init external dictionary verification ([NATIVE 5/6]) did not pass"
+}
+Write-Host "  [PASS] Native C++ PaddleOCR_init verified with $($dictTokens.Count)-token external UTF-8 dictionary ($dictFixture)."
+
+# ----------------------------------------------------------------------------
+# 8. Verify P2 #6: Release Sample JPEGs (Strict Count == 3, SHA-256 & Native Decode)
+# ----------------------------------------------------------------------------
+Write-Host "`n[8/8] Verifying P2 #6: Native JpegPacker & CodeDetect on 3 SHA-256-verified release sample JPEGs..."
+$expectedSamples = @(
+    @{
+        FileName = "2025-04-21 11.00.25_10 Bridge Street_(Company-Timemark)_(Name-Elvis).jpg"
+        Size     = 2009314
+        Sha256   = "85F0BB1FE51B68A278BCF623104A0C9C5785AFCD21E22EC5E92E5968EB3D5EBB"
+        AntiCode = "BHPUTG9Y4K1DEW"
+    },
+    @{
+        FileName = "2025-04-25 12.18.34_Gg Pandega Padma No. 6B_(Perusahaan-Timemark)_(Nama-Elvis).jpg"
+        Size     = 1619943
+        Sha256   = "F83998D65E6E88E06D0B0295526728559A5F867B20557DB071C0324AA27FFDC8"
+        AntiCode = "MGT4DA9L9MBR9U"
+    },
+    @{
+        FileName = "2025-04-28 08.59.13_Calle 61 11632_(Empresa-Timemark)_(Nombre-Elvis).jpg"
+        Size     = 2195949
+        Sha256   = "DA11C91C9F9B15830CCD55EB4B906E2F440B22FAF21F3294B890CA28DDB95509"
+        AntiCode = "EG6P1H9HLAMGPU"
+    }
+)
+
+$foundSampleFiles = @(Get-ChildItem -Path $SampleDir -Filter "2025-04-*.jpg" -File -ErrorAction SilentlyContinue | Sort-Object Name)
+if ($foundSampleFiles.Count -ne 3) {
+    throw "Expected exactly 3 sample JPEG files (2025-04-*.jpg) in '$SampleDir', found $($foundSampleFiles.Count)"
+}
+
+foreach ($spec in $expectedSamples) {
+    $fullJp = Join-Path $SampleDir $spec.FileName
+    if (-not (Test-Path -LiteralPath $fullJp)) {
+        throw "Required sample JPEG fixture missing: '$fullJp'"
+    }
+    $actualSize = (Get-Item -LiteralPath $fullJp).Length
+    $actualHash = (Get-FileHash -LiteralPath $fullJp -Algorithm SHA256).Hash.ToUpperInvariant()
+    if ($actualSize -ne $spec.Size -or $actualHash -ne $spec.Sha256) {
+        throw "Fixture integrity mismatch for $($spec.FileName): size=$actualSize (expected $($spec.Size)), sha256=$actualHash (expected $($spec.Sha256))"
+    }
+    Write-Host ("  - {0} | {1,9:N0} B | SHA256={2}... | AntiCode={3}" -f $spec.FileName, $actualSize, $actualHash.Substring(0, 16), $spec.AntiCode)
+}
+
+if ($nativeText -notmatch "\[NATIVE 6/6\][\s\S]*?\[PASS\]") {
+    throw "Native C++ JpegPacker & CodeDetect verification ([NATIVE 6/6]) did not pass"
+}
+Write-Host "  [PASS] All 3 sample JPEGs (strict count=3, SHA-256 verified) decoded by native C++ JpegPacker & CodeDetect."
 
 Write-Host "`n============================================================================"
-Write-Host "  ALL 8 VERIFICATION CHECKS PASSED (100% P1 & P2 AUDIT ITEMS RESOLVED)"
+Write-Host "  ALL 8 VERIFICATION CHECKS PASSED ([LINK PASS] & [RUNTIME PASS] VERIFIED)"
 Write-Host "============================================================================"

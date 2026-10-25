@@ -1511,9 +1511,9 @@ Java_com_xhey_xcamera_util_JNIUtils_getDeviceFeature(
     std::string pkgName;
     ExtractApkCertificateBytes(env, contextObj, certBytes, pkgName);
 
-    std::ostringstream raw;
-    raw << pkgName << "|" << brand << "|" << model << "|" << board << "|" << deviceNewTime;
-    std::string rawStr = raw.str();
+    char timeBuf[32] = {0};
+    std::snprintf(timeBuf, sizeof(timeBuf), "%lld", static_cast<long long>(deviceNewTime));
+    std::string rawStr = pkgName + "|" + brand + "|" + model + "|" + board + "|" + timeBuf;
 
     uint8_t digest[32] = {0};
     xhey::jni::ComputeHmacSha256(kVaultMasterKey, sizeof(kVaultMasterKey), rawStr.data(), rawStr.size(), digest);
