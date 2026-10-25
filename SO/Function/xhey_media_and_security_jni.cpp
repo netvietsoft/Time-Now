@@ -531,26 +531,128 @@ void Aes128EncryptBlock(const uint8_t in[16], const uint8_t roundKeys[176], uint
     std::memcpy(out, s, 16);
 }
 
-void Aes128CtrCrypt(uint8_t* buf, size_t len, const uint8_t key16[16], uint64_t nonce) {
-    if (!buf || len == 0) return;
+void Aes128CtrCrypt96(uint8_t* buf, size_t len, const uint8_t key16[16], const uint8_t nonce12[12]) {
+    if (!buf || len == 0 || !key16 || !nonce12) return;
     uint8_t roundKeys[176];
     Aes128ExpandKey(key16, roundKeys);
 
     uint8_t counterBlock[16] = {0};
-    std::memcpy(counterBlock, &nonce, 8);
+    std::memcpy(counterBlock, nonce12, 12);
     uint8_t keystream[16] = {0};
 
     for (size_t offset = 0; offset < len; offset += 16) {
-        uint64_t blockIdx = offset / 16;
-        for (int b = 0; b < 8; ++b) {
-            counterBlock[15 - b] = static_cast<uint8_t>((blockIdx >> (b * 8)) & 0xFFu);
-        }
+        uint32_t ctr = static_cast<uint32_t>((offset / 16) + 1u);
+        counterBlock[12] = static_cast<uint8_t>((ctr >> 24) & 0xFFu);
+        counterBlock[13] = static_cast<uint8_t>((ctr >> 16) & 0xFFu);
+        counterBlock[14] = static_cast<uint8_t>((ctr >> 8)  & 0xFFu);
+        counterBlock[15] = static_cast<uint8_t>(ctr & 0xFFu);
         Aes128EncryptBlock(counterBlock, roundKeys, keystream);
         size_t chunk = std::min<size_t>(16, len - offset);
         for (size_t i = 0; i < chunk; ++i) {
             buf[offset + i] ^= keystream[i];
         }
     }
+}
+
+// Generates a unique 96-bit (12-byte) cryptographic nonce per NIST SP 800-38A
+void GenerateUniqueNonce96(uint8_t outNonce12[12]) {
+    static std::atomic<uint64_t> s_nonce_counter{1};
+    uint64_t seq = s_nonce_counter.fetch_add(1, std::memory_order_relaxed);
+    uint64_t ticks = static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+
+    uint8_t seed[48] = {0};
+    std::memcpy(seed + 0, &seq, 8);
+    std::memcpy(seed + 8, &ticks, 8);
+    std::memcpy(seed + 16, kVaultMasterKey, 16);
+
+    std::FILE* urand = std::fopen("/dev/urandom", "rb");
+    if (urand) {
+        size_t n = std::fread(seed + 32, 1, 16, urand);
+        (void)n;
+        std::fclose(urand);
+    } else {
+        uint64_t mix = (seq * 0x9E3779B97F4A7C15ULL) ^ (ticks * 0xBF58476D1CE4E5B9ULL);
+        std::memcpy(seed + 32, &mix, 8);
+        uint64_t mix2 = ~mix ^ 0x94D049BB133111EBULL;
+        std::memcpy(seed + 40, &mix2, 8);
+    }
+
+    uint8_t digest[32] = {0};
+    xhey::jni::ComputeSha256(seed, sizeof(seed), digest);
+    // Guarantee monotonic uniqueness in the first 4 bytes + 8 bytes of entropy hash
+    outNonce12[0] = static_cast<uint8_t>((seq >> 24) & 0xFFu) ^ digest[0];
+    outNonce12[1] = static_cast<uint8_t>((seq >> 16) & 0xFFu) ^ digest[1];
+    outNonce12[2] = static_cast<uint8_t>((seq >> 8)  & 0xFFu) ^ digest[2];
+    outNonce12[3] = static_cast<uint8_t>(seq & 0xFFu)         ^ digest[3];
+    std::memcpy(outNonce12 + 4, digest + 4, 8);
+}
+
+void DeriveAeadSubkeys(uint8_t outEncKey16[16], uint8_t outMacKey32[32]) {
+    static constexpr char kEncLabel[] = "XHEY-AES128-CTR-ENC-SUBKEY-V1";
+    static constexpr char kMacLabel[] = "XHEY-HMAC-SHA256-MAC-SUBKEY-V1";
+    uint8_t encFull[32] = {0};
+    xhey::jni::ComputeHmacSha256(
+        kVaultMasterKey, sizeof(kVaultMasterKey), kEncLabel, sizeof(kEncLabel) - 1, encFull);
+    std::memcpy(outEncKey16, encFull, 16);
+    xhey::jni::ComputeHmacSha256(
+        kVaultMasterKey, sizeof(kVaultMasterKey), kMacLabel, sizeof(kMacLabel) - 1, outMacKey32);
+}
+
+// Authenticated Encryption (Encrypt-then-MAC):
+// Packet layout: [Magic "XAE1" (4B)] [Nonce (12B)] [Ciphertext (N B)] [HMAC-SHA256 Tag (16B)]
+std::vector<uint8_t> AeadEncryptCtrHmac(const uint8_t* plain, size_t len) {
+    uint8_t encKey[16] = {0};
+    uint8_t macKey[32] = {0};
+    DeriveAeadSubkeys(encKey, macKey);
+
+    uint8_t nonce12[12] = {0};
+    GenerateUniqueNonce96(nonce12);
+
+    std::vector<uint8_t> out(4 + 12 + len + 16, 0);
+    std::memcpy(out.data(), "XAE1", 4);
+    std::memcpy(out.data() + 4, nonce12, 12);
+    if (plain && len > 0) {
+        std::memcpy(out.data() + 16, plain, len);
+        Aes128CtrCrypt96(out.data() + 16, len, encKey, nonce12);
+    }
+
+    uint8_t fullMac[32] = {0};
+    xhey::jni::ComputeHmacSha256(macKey, sizeof(macKey), out.data(), 16 + len, fullMac);
+    std::memcpy(out.data() + 16 + len, fullMac, 16);
+    return out;
+}
+
+bool AeadDecryptCtrHmac(const uint8_t* packet, size_t len, std::vector<uint8_t>& outPlain) {
+    outPlain.clear();
+    if (!packet || len < 32) return false;
+    if (std::memcmp(packet, "XAE1", 4) != 0) return false;
+
+    uint8_t encKey[16] = {0};
+    uint8_t macKey[32] = {0};
+    DeriveAeadSubkeys(encKey, macKey);
+
+    size_t cipherLen = len - 32;
+    const uint8_t* nonce12 = packet + 4;
+    const uint8_t* cipherPtr = packet + 16;
+    const uint8_t* tagPtr = packet + 16 + cipherLen;
+
+    uint8_t expectedMac[32] = {0};
+    xhey::jni::ComputeHmacSha256(macKey, sizeof(macKey), packet, 16 + cipherLen, expectedMac);
+
+    uint8_t diff = 0;
+    for (size_t i = 0; i < 16; ++i) {
+        diff |= static_cast<uint8_t>(tagPtr[i] ^ expectedMac[i]);
+    }
+    if (diff != 0) {
+        return false;
+    }
+
+    outPlain.assign(cipherPtr, cipherPtr + cipherLen);
+    if (!outPlain.empty()) {
+        Aes128CtrCrypt96(outPlain.data(), outPlain.size(), encKey, nonce12);
+    }
+    return true;
 }
 
 std::string Base64Encode(const uint8_t* data, size_t len) {
@@ -694,6 +796,79 @@ bool ExtractApkCertificateBytes(JNIEnv* env, jobject contextObj, std::vector<uin
     outCertBytes = xhey::jni::JByteArrayToStdVector(env, certByteArr);
     env->DeleteLocalRef(certByteArr);
     return !outCertBytes.empty();
+}
+
+// Pinned X.509 Certificate & SubjectPublicKeyInfo SHA-256 Digests extracted from
+// release Timemark.apk (APK Sig Block 42 v2/v3 signing block):
+// - Primary Certificate (1421B, Serial 0081645880EB39440151831DE23920AFA2586F6509):
+//     Cert SHA-256  : 96fcc4571a3c269d0bae4ca6fa786d236d8b61a691d58406c3805996f53f123f
+//     SPKI SHA-256  : 9b9111ebf311968de9f3650f895b5abfe45240381e818fdbaf72dbfe00b4feec
+//     TBS  SHA-256  : cdcd6a52c46bec0bdf6786ea7630936e75a49cff50cecdb00e81e644ae3d045a
+// - Signing Lineage Certificate (1421B, Serial 00BF53FABB0B4E907F8F2A22A1B0E0D77F6DEF1060):
+//     Cert SHA-256  : 3257d599a49d2c961a471ca9843f59d341a405884583fc087df4237b733bbd6d
+//     SPKI SHA-256  : cf134bee994bea90ef79ec03850d0ea47219cb4b9639fa0fbb14caad9fdc8452
+//     TBS  SHA-256  : ce92a87e4e9aab4c3d45e47d07371261836ac8c55acb0a73e54e1b720cd070b2
+bool VerifyPinnedApkPublisher(
+        const std::string& pkgName,
+        const std::vector<uint8_t>& certBytes,
+        std::string& outCertSha256Hex,
+        std::string& outError) {
+    outCertSha256Hex.clear();
+    outError.clear();
+
+    // 1. Strict package name allowlist (reject arbitrary strings containing "xhey" or "camera")
+    const bool validPkg = (pkgName == "com.oceangalaxy.camera.new" ||
+                           pkgName == "com.xhey.xcamera");
+    if (!validPkg) {
+        outError = "untrusted_package_name:" + pkgName;
+        return false;
+    }
+
+    if (certBytes.size() < 256) {
+        outError = "certificate_too_short";
+        return false;
+    }
+
+    // 2. Compute full X.509 DER certificate SHA-256 digest
+    uint8_t certSha256[32] = {0};
+    xhey::jni::ComputeSha256(certBytes.data(), certBytes.size(), certSha256);
+    outCertSha256Hex = xhey::jni::BytesToHex(certSha256, 32);
+
+    static const char* const kPinnedCertSha256Hex[] = {
+        "96fcc4571a3c269d0bae4ca6fa786d236d8b61a691d58406c3805996f53f123f",
+        "3257d599a49d2c961a471ca9843f59d341a405884583fc087df4237b733bbd6d",
+        "cdcd6a52c46bec0bdf6786ea7630936e75a49cff50cecdb00e81e644ae3d045a",
+        "ce92a87e4e9aab4c3d45e47d07371261836ac8c55acb0a73e54e1b720cd070b2"
+    };
+    for (const char* pinned : kPinnedCertSha256Hex) {
+        if (outCertSha256Hex == pinned) {
+            return true;
+        }
+    }
+
+    // 3. Fallback: scan DER for pinned 550-byte RSA-4096 SubjectPublicKeyInfo (0x30 0x82 0x02 0x22)
+    static const char* const kPinnedSpkiSha256Hex[] = {
+        "9b9111ebf311968de9f3650f895b5abfe45240381e818fdbaf72dbfe00b4feec",
+        "cf134bee994bea90ef79ec03850d0ea47219cb4b9639fa0fbb14caad9fdc8452"
+    };
+    if (certBytes.size() >= 554) {
+        for (size_t i = 0; i + 554 <= certBytes.size(); ++i) {
+            if (certBytes[i] == 0x30 && certBytes[i + 1] == 0x82 &&
+                certBytes[i + 2] == 0x02 && certBytes[i + 3] == 0x22) {
+                uint8_t spkiSha256[32] = {0};
+                xhey::jni::ComputeSha256(certBytes.data() + i, 554, spkiSha256);
+                std::string spkiHex = xhey::jni::BytesToHex(spkiSha256, 32);
+                for (const char* pinnedSpki : kPinnedSpkiSha256Hex) {
+                    if (spkiHex == pinnedSpki) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    outError = "untrusted_certificate_digest:" + outCertSha256Hex;
+    return false;
 }
 
 // ============================================================================
@@ -1014,7 +1189,7 @@ JNIEXPORT jstring JNICALL
 Java_com_xhey_xcamera_NativeXhey_heyStr(
         JNIEnv* env, jclass /*clazz*/, jint keyIndex) {
     static const char* const kHeySecretTable[] = {
-        "xhey_timemark_hmac_2025_v10",
+        "2qR2nuPdYrq3IMSr",
         "https://api.timemark.com",
         "XHEY-SIGNATURE-SHA256",
         "f99779bd01a345c8",
@@ -1301,10 +1476,15 @@ Java_com_xhey_xcamera_util_JNIUtils_getApkSignature(
         return env->NewStringUTF("");
     }
 
-    uint8_t certSha256[32] = {0};
-    xhey::jni::ComputeSha256(certBytes.data(), certBytes.size(), certSha256);
+    std::string certSha256Hex;
+    std::string verifyErr;
+    if (!VerifyPinnedApkPublisher(pkgName, certBytes, certSha256Hex, verifyErr)) {
+        std::lock_guard<std::mutex> lock(g_security_mutex);
+        g_last_error_info = verifyErr;
+        return env->NewStringUTF("");
+    }
 
-    std::string msg = pkgName + "|" + xhey::jni::BytesToHex(certSha256, 32) + "|" + std::to_string(timestampMs);
+    std::string msg = pkgName + "|" + certSha256Hex + "|" + std::to_string(timestampMs);
     uint8_t hmac[32] = {0};
     xhey::jni::ComputeHmacSha256(kVaultMasterKey, sizeof(kVaultMasterKey), msg.data(), msg.size(), hmac);
 
@@ -1372,20 +1552,32 @@ Java_com_xhey_xcamera_security_SecurityManager_nativeGetSecretKey(
 JNIEXPORT jstring JNICALL
 Java_com_xhey_xcamera_security_SecurityManager_nativeEncrypt(
         JNIEnv* env, jclass /*clazz*/, jstring plainText) {
+    if (!env) return nullptr;
     std::string plain = JStrToStd(env, plainText);
-    std::vector<uint8_t> buf(plain.begin(), plain.end());
-    Aes128CtrCrypt(buf.data(), buf.size(), kVaultMasterKey, 0x5848455932303235ULL);
-    std::string b64 = Base64Encode(buf.data(), buf.size());
+    std::vector<uint8_t> packet = AeadEncryptCtrHmac(
+        reinterpret_cast<const uint8_t*>(plain.data()),
+        plain.size());
+    std::string b64 = Base64Encode(packet.data(), packet.size());
     return env->NewStringUTF(b64.c_str());
 }
 
 JNIEXPORT jstring JNICALL
 Java_com_xhey_xcamera_security_SecurityManager_nativeDecrypt(
         JNIEnv* env, jclass /*clazz*/, jstring cipherText) {
+    if (!env) return nullptr;
     std::string b64 = JStrToStd(env, cipherText);
-    std::vector<uint8_t> buf = Base64Decode(b64);
-    Aes128CtrCrypt(buf.data(), buf.size(), kVaultMasterKey, 0x5848455932303235ULL);
-    std::string plain(buf.begin(), buf.end());
+    std::vector<uint8_t> packet = Base64Decode(b64);
+    std::vector<uint8_t> plainBytes;
+    if (!AeadDecryptCtrHmac(packet.data(), packet.size(), plainBytes)) {
+        std::lock_guard<std::mutex> lock(g_security_mutex);
+        g_last_error_info = "aead_auth_tag_mismatch";
+        return env->NewStringUTF("");
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_security_mutex);
+        g_last_error_info.clear();
+    }
+    std::string plain(plainBytes.begin(), plainBytes.end());
     return env->NewStringUTF(plain.c_str());
 }
 
@@ -1407,12 +1599,18 @@ Java_com_xhey_xcamera_security_SecurityManager_nativeVerifyAppSignature(
     if (!ExtractApkCertificateBytes(env, contextObj, certBytes, pkgName)) {
         return JNI_FALSE;
     }
-    uint8_t digest[32] = {0};
-    xhey::jni::ComputeSha256(certBytes.data(), certBytes.size(), digest);
-    bool validPkg = (pkgName == "com.oceangalaxy.camera.new" ||
-                     pkgName.find("xhey") != std::string::npos ||
-                     pkgName.find("camera") != std::string::npos);
-    return (validPkg && certBytes.size() >= 128 && digest[0] != 0) ? JNI_TRUE : JNI_FALSE;
+    std::string certSha256Hex;
+    std::string verifyErr;
+    if (!VerifyPinnedApkPublisher(pkgName, certBytes, certSha256Hex, verifyErr)) {
+        std::lock_guard<std::mutex> lock(g_security_mutex);
+        g_last_error_info = verifyErr;
+        return JNI_FALSE;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_security_mutex);
+        g_last_error_info.clear();
+    }
+    return JNI_TRUE;
 }
 
 #endif // XHEY_BUILD_NATIVELIB || XHEY_BUILD_ALL

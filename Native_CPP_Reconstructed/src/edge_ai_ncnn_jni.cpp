@@ -57,7 +57,7 @@
 // ============================================================================
 // Lightweight NCNN Compatibility Layer (Supports standalone & linked libncnn.a)
 // ============================================================================
-#if __has_include("net.h")
+#if defined(XHEY_USE_OFFICIAL_NCNN) && __has_include("net.h")
 #include "net.h"
 #include "mat.h"
 #else
@@ -93,34 +93,44 @@ public:
     };
 
     Mat() = default;
-    Mat(int _w, float* ext = nullptr) : dims(1), w(_w), h(1), c(1), cstep(_w) {
+    explicit Mat(int _w, float* ext = nullptr)
+        : dims(1), w(_w), h(1), c(1), cstep(static_cast<size_t>(std::max(0, _w))) {
         if (ext) {
             data = ext;
-        } else {
-            storage.resize(static_cast<size_t>(_w), 0.0f);
+        } else if (_w > 0) {
+            storage.resize(cstep, 0.0f);
             data = storage.data();
         }
     }
-    Mat(int _w, int _h, float* ext = nullptr) : dims(2), w(_w), h(_h), c(1), cstep(static_cast<size_t>(_w) * _h) {
+    Mat(int _w, int _h, float* ext = nullptr)
+        : dims(2), w(_w), h(_h), c(1), cstep(static_cast<size_t>(std::max(0, _w)) * std::max(0, _h)) {
         if (ext) {
             data = ext;
-        } else {
-            storage.resize(static_cast<size_t>(_w) * _h, 0.0f);
+        } else if (_w > 0 && _h > 0) {
+            storage.resize(cstep, 0.0f);
             data = storage.data();
         }
     }
     Mat(int _w, int _h, int _c, float* ext = nullptr)
-        : dims(3), w(_w), h(_h), c(_c), cstep(static_cast<size_t>(_w) * _h) {
+        : dims(3), w(_w), h(_h), c(_c), cstep(static_cast<size_t>(std::max(0, _w)) * std::max(0, _h)) {
         if (ext) {
             data = ext;
-        } else {
-            storage.resize(cstep * _c, 0.0f);
+        } else if (_w > 0 && _h > 0 && _c > 0) {
+            storage.resize(cstep * static_cast<size_t>(_c), 0.0f);
             data = storage.data();
         }
     }
     Mat(const Mat& other)
         : dims(other.dims), w(other.w), h(other.h), c(other.c), cstep(other.cstep), storage(other.storage) {
-        data = storage.empty() ? other.data : storage.data();
+        if (!storage.empty()) {
+            data = storage.data();
+        } else if (other.data && other.cstep * std::max(1, other.c) > 0) {
+            size_t total = other.cstep * static_cast<size_t>(std::max(1, other.c));
+            storage.assign(other.data, other.data + total);
+            data = storage.data();
+        } else {
+            data = nullptr;
+        }
     }
     Mat& operator=(const Mat& other) {
         if (this != &other) {
@@ -130,17 +140,27 @@ public:
             c = other.c;
             cstep = other.cstep;
             storage = other.storage;
-            data = storage.empty() ? other.data : storage.data();
+            if (!storage.empty()) {
+                data = storage.data();
+            } else if (other.data && other.cstep * std::max(1, other.c) > 0) {
+                size_t total = other.cstep * static_cast<size_t>(std::max(1, other.c));
+                storage.assign(other.data, other.data + total);
+                data = storage.data();
+            } else {
+                data = nullptr;
+            }
         }
         return *this;
     }
 
-    bool empty() const { return data == nullptr || w <= 0; }
+    bool empty() const { return data == nullptr || w <= 0 || h <= 0 || c <= 0; }
+    size_t total() const { return cstep * static_cast<size_t>(std::max(1, c)); }
+
     void fill(float v) {
         if (!storage.empty()) {
             std::fill(storage.begin(), storage.end(), v);
         } else if (data) {
-            std::fill(data, data + cstep * std::max(1, c), v);
+            std::fill(data, data + total(), v);
         }
     }
     Mat channel(int ch) {
@@ -233,7 +253,10 @@ struct LayerNode {
     std::vector<std::string> bottoms;
     std::vector<std::string> tops;
     std::unordered_map<int, float> params;
-    size_t weight_offset = 0;
+    std::unordered_map<int, std::vector<float>> array_params;
+    std::vector<float> weight_data;
+    std::vector<float> bias_data;
+    std::vector<float> weight_hc_data;
 };
 
 inline float Fp16ToFp32(uint16_t h) {
@@ -263,12 +286,44 @@ inline float Fp16ToFp32(uint16_t h) {
     return out;
 }
 
-class Net;
+inline void ApplyFusedActivation(Mat& m, int activation_type) {
+    if (activation_type == 0 || m.empty()) return;
+    size_t total = m.total();
+    if (activation_type == 1) { // ReLU
+        for (size_t i = 0; i < total; ++i) {
+            if (m.data[i] < 0.0f) m.data[i] = 0.0f;
+        }
+    } else if (activation_type == 4) { // Sigmoid
+        for (size_t i = 0; i < total; ++i) {
+            m.data[i] = 1.0f / (1.0f + std::exp(-std::clamp(m.data[i], -20.0f, 20.0f)));
+        }
+    } else if (activation_type == 5) { // Mish / TanH
+        for (size_t i = 0; i < total; ++i) {
+            m.data[i] = std::tanh(m.data[i]);
+        }
+    }
+}
+
+inline float EvalBinaryScalarOp(float a, float b, int op_type) {
+    switch (op_type) {
+        case 0: return a + b;
+        case 1: return a - b;
+        case 2: return a * b;
+        case 3: return (std::fabs(b) > 1e-12f) ? (a / b) : 0.0f;
+        case 4: return std::max(a, b);
+        case 5: return std::min(a, b);
+        case 6: return std::pow(a, b);
+        case 7: return b - a;
+        case 8: return (std::fabs(a) > 1e-12f) ? (b / a) : 0.0f;
+        default: return a + b;
+    }
+}
 
 class Extractor {
 public:
     const std::vector<LayerNode>* layers = nullptr;
-    const std::vector<float>* weights = nullptr;
+    bool net_loaded = false;
+    bool graph_executed = false;
     std::unordered_map<std::string, Mat> blobs;
     bool light_mode = true;
     int num_threads = 4;
@@ -277,27 +332,24 @@ public:
     void set_num_threads(int n) { num_threads = std::max(1, n); }
 
     int input(const char* name, const Mat& in) {
-        blobs[name ? name : "input"] = in;
+        if (!name || in.empty()) return -1;
+        blobs[name] = in;
+        graph_executed = false;
         return 0;
     }
 
-    float sampleWeight(size_t idx, float fallback) const {
-        if (weights && !weights->empty()) {
-            float w = (*weights)[idx % weights->size()];
-            if (std::isfinite(w)) return std::clamp(w, -4.0f, 4.0f);
-        }
-        return fallback;
-    }
-
-    void executeLayerGraph() {
-        if (!layers || layers->empty()) return;
+    bool executeLayerGraph() {
+        if (!net_loaded || !layers || layers->empty()) return false;
         for (size_t li = 0; li < layers->size(); ++li) {
             const LayerNode& ln = (*layers)[li];
+            if (ln.type == "Input") continue;
             if (ln.bottoms.empty() || ln.tops.empty()) continue;
-            auto itB = blobs.find(ln.bottoms[0]);
-            if (itB == blobs.end()) continue;
-            const Mat& b0 = itB->second;
-            if (b0.empty()) continue;
+
+            auto itB0 = blobs.find(ln.bottoms[0]);
+            if (itB0 == blobs.end() || itB0->second.empty()) {
+                return false;
+            }
+            const Mat& b0 = itB0->second;
 
             if (ln.type == "Split") {
                 for (const auto& topName : ln.tops) {
@@ -306,7 +358,7 @@ public:
             } else if (ln.type == "ReLU") {
                 float slope = ln.params.count(0) ? ln.params.at(0) : 0.0f;
                 Mat top = b0;
-                size_t total = top.cstep * std::max(1, top.c);
+                size_t total = top.total();
                 for (size_t i = 0; i < total; ++i) {
                     float v = top.data[i];
                     top.data[i] = (v >= 0.0f) ? v : (v * slope);
@@ -314,21 +366,21 @@ public:
                 blobs[ln.tops[0]] = std::move(top);
             } else if (ln.type == "Sigmoid") {
                 Mat top = b0;
-                size_t total = top.cstep * std::max(1, top.c);
+                size_t total = top.total();
                 for (size_t i = 0; i < total; ++i) {
                     top.data[i] = 1.0f / (1.0f + std::exp(-std::clamp(top.data[i], -20.0f, 20.0f)));
                 }
                 blobs[ln.tops[0]] = std::move(top);
             } else if (ln.type == "TanH") {
                 Mat top = b0;
-                size_t total = top.cstep * std::max(1, top.c);
+                size_t total = top.total();
                 for (size_t i = 0; i < total; ++i) {
                     top.data[i] = std::tanh(top.data[i]);
                 }
                 blobs[ln.tops[0]] = std::move(top);
             } else if (ln.type == "Softmax") {
                 Mat top = b0;
-                size_t total = top.cstep * std::max(1, top.c);
+                size_t total = top.total();
                 float maxV = -1e30f;
                 for (size_t i = 0; i < total; ++i) maxV = std::max(maxV, top.data[i]);
                 float sum = 0.0f;
@@ -339,244 +391,820 @@ public:
                 float inv = (sum > 1e-9f) ? (1.0f / sum) : 1.0f;
                 for (size_t i = 0; i < total; ++i) top.data[i] *= inv;
                 blobs[ln.tops[0]] = std::move(top);
-            } else if (ln.type == "Convolution" || ln.type == "DepthWiseConvolution") {
-                int outCh = ln.params.count(0) ? std::clamp(static_cast<int>(ln.params.at(0)), 1, 64) : b0.c;
-                int stride = ln.params.count(3) ? std::max(1, static_cast<int>(ln.params.at(3))) : 1;
-                int outW = std::max(1, b0.w / stride);
-                int outH = std::max(1, b0.h / stride);
-                Mat top(outW, outH, outCh);
-                for (int oc = 0; oc < outCh; ++oc) {
-                    const float* sp = b0.channel(oc % std::max(1, b0.c)).data;
-                    float* dp = top.channel(oc).data;
-                    float wgt = sampleWeight(ln.weight_offset + static_cast<size_t>(oc) * 9, 0.32f);
-                    float bias = sampleWeight(ln.weight_offset + static_cast<size_t>(oc) + 3, 0.02f);
-                    for (int y = 0; y < outH; ++y) {
-                        int sy = std::min(b0.h - 1, y * stride);
-                        for (int x = 0; x < outW; ++x) {
-                            int sx = std::min(b0.w - 1, x * stride);
-                            float v = sp[static_cast<size_t>(sy) * b0.w + sx];
-                            dp[static_cast<size_t>(y) * outW + x] = v * wgt + bias;
+            } else if (ln.type == "UnaryOp") {
+                int op_type = ln.params.count(0) ? static_cast<int>(ln.params.at(0)) : 0;
+                Mat top = b0;
+                size_t total = top.total();
+                for (size_t i = 0; i < total; ++i) {
+                    float x = top.data[i];
+                    switch (op_type) {
+                        case 0: top.data[i] = std::fabs(x); break;
+                        case 1: top.data[i] = -x; break;
+                        case 2: top.data[i] = std::floor(x); break;
+                        case 3: top.data[i] = std::ceil(x); break;
+                        case 4: top.data[i] = x * x; break;
+                        case 5: top.data[i] = std::sqrt(std::max(0.0f, x)); break;
+                        case 6: top.data[i] = 1.0f / std::sqrt(std::max(1e-12f, x)); break;
+                        case 7: top.data[i] = std::exp(std::clamp(x, -40.0f, 40.0f)); break;
+                        case 8: top.data[i] = std::log(std::max(1e-12f, x)); break;
+                        case 9: top.data[i] = std::sin(x); break;
+                        case 10: top.data[i] = std::cos(x); break;
+                        case 11: top.data[i] = std::tan(x); break;
+                        case 12: top.data[i] = std::asin(std::clamp(x, -1.0f, 1.0f)); break;
+                        case 13: top.data[i] = std::acos(std::clamp(x, -1.0f, 1.0f)); break;
+                        case 14: top.data[i] = std::atan(x); break;
+                        case 15: top.data[i] = (std::fabs(x) > 1e-12f) ? (1.0f / x) : 0.0f; break;
+                        case 16: top.data[i] = std::tanh(x); break;
+                        default: break;
+                    }
+                }
+                blobs[ln.tops[0]] = std::move(top);
+            } else if (ln.type == "BinaryOp") {
+                int op_type = ln.params.count(0) ? static_cast<int>(ln.params.at(0)) : 0;
+                int with_scalar = ln.params.count(1) ? static_cast<int>(ln.params.at(1)) : 0;
+                float scalar_b = ln.params.count(2) ? ln.params.at(2) : 0.0f;
+                Mat top = b0;
+                size_t totalA = top.total();
+                if (with_scalar != 0 || ln.bottoms.size() < 2) {
+                    for (size_t i = 0; i < totalA; ++i) {
+                        top.data[i] = EvalBinaryScalarOp(top.data[i], scalar_b, op_type);
+                    }
+                } else {
+                    auto itB1 = blobs.find(ln.bottoms[1]);
+                    if (itB1 == blobs.end() || itB1->second.empty()) return false;
+                    const Mat& b1 = itB1->second;
+                    size_t totalB = b1.total();
+                    if (totalA == totalB) {
+                        for (size_t i = 0; i < totalA; ++i) {
+                            top.data[i] = EvalBinaryScalarOp(top.data[i], b1.data[i], op_type);
+                        }
+                    } else if (totalB == 1) {
+                        float sb = b1.data[0];
+                        for (size_t i = 0; i < totalA; ++i) {
+                            top.data[i] = EvalBinaryScalarOp(top.data[i], sb, op_type);
+                        }
+                    } else if (top.dims == 2 && b1.dims == 2) {
+                        for (int y = 0; y < top.h; ++y) {
+                            int by = std::min(y, b1.h - 1);
+                            for (int x = 0; x < top.w; ++x) {
+                                int bx = std::min(x, b1.w - 1);
+                                top.row(y)[x] = EvalBinaryScalarOp(top.row(y)[x], b1.row(by)[bx], op_type);
+                            }
+                        }
+                    } else {
+                        for (size_t i = 0; i < totalA; ++i) {
+                            top.data[i] = EvalBinaryScalarOp(top.data[i], b1.data[i % totalB], op_type);
                         }
                     }
                 }
                 blobs[ln.tops[0]] = std::move(top);
-            } else if (ln.type == "InnerProduct") {
-                int outDim = ln.params.count(0) ? std::clamp(static_cast<int>(ln.params.at(0)), 1, 1000) : 16;
-                Mat top(outDim);
-                size_t inTotal = b0.cstep * std::max(1, b0.c);
-                for (int o = 0; o < outDim; ++o) {
-                    float acc = sampleWeight(ln.weight_offset + static_cast<size_t>(o), 0.0f);
-                    size_t step = std::max<size_t>(1, inTotal / 32);
-                    for (size_t i = 0; i < inTotal; i += step) {
-                        acc += b0.data[i] * sampleWeight(ln.weight_offset + static_cast<size_t>(o) * 32 + i, 0.05f);
+            } else if (ln.type == "Concat") {
+                int axis = ln.params.count(0) ? static_cast<int>(ln.params.at(0)) : 0;
+                if (b0.dims == 3 && axis == 0) {
+                    int totalC = 0;
+                    for (const auto& bName : ln.bottoms) {
+                        auto it = blobs.find(bName);
+                        if (it == blobs.end()) return false;
+                        totalC += it->second.c;
                     }
-                    top.data[o] = acc;
+                    Mat top(b0.w, b0.h, totalC);
+                    int curC = 0;
+                    for (const auto& bName : ln.bottoms) {
+                        const Mat& bi = blobs.at(bName);
+                        for (int ch = 0; ch < bi.c; ++ch) {
+                            std::memcpy(top.channel(curC++).data, bi.channel(ch).data, bi.cstep * sizeof(float));
+                        }
+                    }
+                    blobs[ln.tops[0]] = std::move(top);
+                } else if (b0.dims == 2 && (axis == 0 || axis == -2)) {
+                    int totalH = 0;
+                    for (const auto& bName : ln.bottoms) {
+                        auto it = blobs.find(bName);
+                        if (it == blobs.end()) return false;
+                        totalH += it->second.h;
+                    }
+                    Mat top(b0.w, totalH);
+                    int curY = 0;
+                    for (const auto& bName : ln.bottoms) {
+                        const Mat& bi = blobs.at(bName);
+                        for (int y = 0; y < bi.h; ++y) {
+                            std::memcpy(top.row(curY++), bi.row(y), static_cast<size_t>(bi.w) * sizeof(float));
+                        }
+                    }
+                    blobs[ln.tops[0]] = std::move(top);
+                } else if (b0.dims == 2 && (axis == 1 || axis == -1)) {
+                    int totalW = 0;
+                    for (const auto& bName : ln.bottoms) {
+                        auto it = blobs.find(bName);
+                        if (it == blobs.end()) return false;
+                        totalW += it->second.w;
+                    }
+                    Mat top(totalW, b0.h);
+                    for (int y = 0; y < b0.h; ++y) {
+                        int curX = 0;
+                        for (const auto& bName : ln.bottoms) {
+                            const Mat& bi = blobs.at(bName);
+                            std::memcpy(top.row(y) + curX, bi.row(y), static_cast<size_t>(bi.w) * sizeof(float));
+                            curX += bi.w;
+                        }
+                    }
+                    blobs[ln.tops[0]] = std::move(top);
+                } else {
+                    int totalW = 0;
+                    for (const auto& bName : ln.bottoms) {
+                        auto it = blobs.find(bName);
+                        if (it == blobs.end()) return false;
+                        totalW += static_cast<int>(it->second.total());
+                    }
+                    Mat top(totalW);
+                    size_t off = 0;
+                    for (const auto& bName : ln.bottoms) {
+                        const Mat& bi = blobs.at(bName);
+                        std::memcpy(top.data + off, bi.data, bi.total() * sizeof(float));
+                        off += bi.total();
+                    }
+                    blobs[ln.tops[0]] = std::move(top);
+                }
+            } else if (ln.type == "Slice") {
+                int axis = ln.params.count(1) ? static_cast<int>(ln.params.at(1)) : 0;
+                std::vector<float> slicePoints;
+                if (ln.array_params.count(0)) slicePoints = ln.array_params.at(0);
+                size_t numTops = ln.tops.size();
+                if (b0.dims == 3 && axis == 0) {
+                    int totalC = b0.c;
+                    int explicitSum = 0;
+                    int autoCount = 0;
+                    for (size_t i = 0; i < numTops; ++i) {
+                        int s = (i < slicePoints.size()) ? static_cast<int>(slicePoints[i]) : -233;
+                        if (s > 0) explicitSum += s;
+                        else ++autoCount;
+                    }
+                    int autoSlice = (autoCount > 0) ? std::max(1, (totalC - explicitSum) / autoCount) : 1;
+                    int curC = 0;
+                    for (size_t i = 0; i < numTops; ++i) {
+                        int s = (i < slicePoints.size() && slicePoints[i] > 0) ? static_cast<int>(slicePoints[i]) : autoSlice;
+                        if (i + 1 == numTops) s = std::max(1, totalC - curC);
+                        Mat top(b0.w, b0.h, s);
+                        for (int ch = 0; ch < s && curC + ch < totalC; ++ch) {
+                            std::memcpy(top.channel(ch).data, b0.channel(curC + ch).data, b0.cstep * sizeof(float));
+                        }
+                        curC += s;
+                        blobs[ln.tops[i]] = std::move(top);
+                    }
+                } else if (b0.dims == 2 && axis == 0) {
+                    int totalH = b0.h;
+                    int explicitSum = 0;
+                    int autoCount = 0;
+                    for (size_t i = 0; i < numTops; ++i) {
+                        int s = (i < slicePoints.size()) ? static_cast<int>(slicePoints[i]) : -233;
+                        if (s > 0) explicitSum += s;
+                        else ++autoCount;
+                    }
+                    int autoSlice = (autoCount > 0) ? std::max(1, (totalH - explicitSum) / autoCount) : 1;
+                    int curY = 0;
+                    for (size_t i = 0; i < numTops; ++i) {
+                        int s = (i < slicePoints.size() && slicePoints[i] > 0) ? static_cast<int>(slicePoints[i]) : autoSlice;
+                        if (i + 1 == numTops) s = std::max(1, totalH - curY);
+                        Mat top(b0.w, s);
+                        for (int y = 0; y < s && curY + y < totalH; ++y) {
+                            std::memcpy(top.row(y), b0.row(curY + y), static_cast<size_t>(b0.w) * sizeof(float));
+                        }
+                        curY += s;
+                        blobs[ln.tops[i]] = std::move(top);
+                    }
+                }
+            } else if (ln.type == "Reshape") {
+                int targetW = ln.params.count(0) ? static_cast<int>(ln.params.at(0)) : b0.w;
+                int targetH = ln.params.count(1) ? static_cast<int>(ln.params.at(1)) : -233;
+                int targetC = ln.params.count(2) ? static_cast<int>(ln.params.at(2)) : -233;
+                size_t totalElem = b0.total();
+                Mat top;
+                if (targetC > 0 && targetH > 0 && targetW > 0) {
+                    top = Mat(targetW, targetH, targetC);
+                } else if (targetH > 0 && targetW > 0) {
+                    top = Mat(targetW, targetH);
+                } else {
+                    top = Mat(std::max(1, targetW));
+                }
+                size_t copyCount = std::min(totalElem, top.total());
+                std::memcpy(top.data, b0.data, copyCount * sizeof(float));
+                blobs[ln.tops[0]] = std::move(top);
+            } else if (ln.type == "Padding") {
+                int topPad = ln.params.count(0) ? static_cast<int>(ln.params.at(0)) : 0;
+                int botPad = ln.params.count(1) ? static_cast<int>(ln.params.at(1)) : 0;
+                int leftPad = ln.params.count(2) ? static_cast<int>(ln.params.at(2)) : 0;
+                int rightPad = ln.params.count(3) ? static_cast<int>(ln.params.at(3)) : 0;
+                int padType = ln.params.count(4) ? static_cast<int>(ln.params.at(4)) : 0;
+                float padVal = ln.params.count(5) ? ln.params.at(5) : 0.0f;
+
+                int outW = b0.w + leftPad + rightPad;
+                int outH = b0.h + topPad + botPad;
+                Mat top = (b0.dims == 3) ? Mat(outW, outH, b0.c) : Mat(outW, outH);
+                auto mapCoord = [](int p, int len, int type) -> int {
+                    if (p >= 0 && p < len) return p;
+                    if (type == 1) return std::clamp(p, 0, len - 1);
+                    if (type == 2 && len > 1) {
+                        while (p < 0 || p >= len) {
+                            if (p < 0) p = -p;
+                            if (p >= len) p = 2 * len - 2 - p;
+                        }
+                        return std::clamp(p, 0, len - 1);
+                    }
+                    return -1;
+                };
+                for (int ch = 0; ch < std::max(1, b0.c); ++ch) {
+                    const float* srcCh = (b0.dims == 3) ? b0.channel(ch).data : b0.data;
+                    float* dstCh = (top.dims == 3) ? top.channel(ch).data : top.data;
+                    for (int y = 0; y < outH; ++y) {
+                        int sy = mapCoord(y - topPad, b0.h, padType);
+                        for (int x = 0; x < outW; ++x) {
+                            int sx = mapCoord(x - leftPad, b0.w, padType);
+                            dstCh[static_cast<size_t>(y) * outW + x] =
+                                (sx >= 0 && sy >= 0) ? srcCh[static_cast<size_t>(sy) * b0.w + sx] : padVal;
+                        }
+                    }
                 }
                 blobs[ln.tops[0]] = std::move(top);
-            } else {
-                for (const auto& topName : ln.tops) {
-                    blobs[topName] = b0;
+            } else if (ln.type == "Squeeze") {
+                Mat top;
+                if (b0.dims == 3 && b0.c == 1) {
+                    top = Mat(b0.w, b0.h);
+                } else if (b0.dims == 2 && b0.h == 1) {
+                    top = Mat(b0.w);
+                } else {
+                    top = b0;
                 }
+                std::memcpy(top.data, b0.data, std::min(top.total(), b0.total()) * sizeof(float));
+                blobs[ln.tops[0]] = std::move(top);
+            } else if (ln.type == "ExpandDims") {
+                Mat top;
+                if (b0.dims == 1) {
+                    top = Mat(b0.w);
+                } else if (b0.dims == 2) {
+                    top = Mat(b0.w, b0.h, 1);
+                } else {
+                    top = b0;
+                }
+                std::memcpy(top.data, b0.data, std::min(top.total(), b0.total()) * sizeof(float));
+                blobs[ln.tops[0]] = std::move(top);
+            } else if (ln.type == "Crop") {
+                if (ln.array_params.count(9) && ln.array_params.count(10) && ln.array_params.count(11)) {
+                    int start = static_cast<int>(ln.array_params.at(9)[0]);
+                    int end   = static_cast<int>(ln.array_params.at(10)[0]);
+                    int axis  = static_cast<int>(ln.array_params.at(11)[0]);
+                    if (b0.dims == 3 && axis == 0) {
+                        if (start < 0) start += b0.c;
+                        if (end < 0) end += b0.c;
+                        start = std::clamp(start, 0, b0.c);
+                        end = std::clamp(end, start + 1, b0.c);
+                        int outC = end - start;
+                        Mat top(b0.w, b0.h, outC);
+                        for (int ch = 0; ch < outC; ++ch) {
+                            std::memcpy(top.channel(ch).data, b0.channel(start + ch).data, b0.cstep * sizeof(float));
+                        }
+                        blobs[ln.tops[0]] = std::move(top);
+                    } else if (b0.dims == 2 && (axis == 1 || axis == -1)) {
+                        if (start < 0) start += b0.w;
+                        if (end < 0) end += b0.w;
+                        start = std::clamp(start, 0, b0.w);
+                        end = std::clamp(end, start + 1, b0.w);
+                        int outW = end - start;
+                        Mat top(outW, b0.h);
+                        for (int y = 0; y < b0.h; ++y) {
+                            std::memcpy(top.row(y), b0.row(y) + start, static_cast<size_t>(outW) * sizeof(float));
+                        }
+                        blobs[ln.tops[0]] = std::move(top);
+                    } else {
+                        blobs[ln.tops[0]] = b0;
+                    }
+                } else {
+                    int woffset = ln.params.count(0) ? static_cast<int>(ln.params.at(0)) : 0;
+                    int hoffset = ln.params.count(1) ? static_cast<int>(ln.params.at(1)) : 0;
+                    int outw = ln.params.count(3) ? static_cast<int>(ln.params.at(3)) : b0.w;
+                    int outh = ln.params.count(4) ? static_cast<int>(ln.params.at(4)) : b0.h;
+                    outw = std::clamp(outw, 1, std::max(1, b0.w - woffset));
+                    outh = std::clamp(outh, 1, std::max(1, b0.h - hoffset));
+                    Mat top(outw, outh);
+                    for (int y = 0; y < outh; ++y) {
+                        std::memcpy(top.row(y), b0.row(hoffset + y) + woffset, static_cast<size_t>(outw) * sizeof(float));
+                    }
+                    blobs[ln.tops[0]] = std::move(top);
+                }
+            } else if (ln.type == "Reduction") {
+                int op = ln.params.count(0) ? static_cast<int>(ln.params.at(0)) : 3;
+                int keepdims = ln.params.count(4) ? static_cast<int>(ln.params.at(4)) : 0;
+                int axis = 0;
+                if (ln.array_params.count(3) && !ln.array_params.at(3).empty()) {
+                    axis = static_cast<int>(ln.array_params.at(3)[0]);
+                }
+                if (b0.dims == 2 && axis == 0) {
+                    Mat top = keepdims ? Mat(b0.w, 1) : Mat(b0.w);
+                    for (int x = 0; x < b0.w; ++x) {
+                        float acc = 0.0f;
+                        for (int y = 0; y < b0.h; ++y) acc += b0.row(y)[x];
+                        top.data[x] = (op == 3) ? (acc / std::max(1, b0.h)) : acc;
+                    }
+                    blobs[ln.tops[0]] = std::move(top);
+                } else if (b0.dims == 2 && (axis == 1 || axis == -1)) {
+                    Mat top = keepdims ? Mat(1, b0.h) : Mat(b0.h);
+                    for (int y = 0; y < b0.h; ++y) {
+                        float acc = 0.0f;
+                        for (int x = 0; x < b0.w; ++x) acc += b0.row(y)[x];
+                        top.data[y] = (op == 3) ? (acc / std::max(1, b0.w)) : acc;
+                    }
+                    blobs[ln.tops[0]] = std::move(top);
+                } else {
+                    Mat top(1);
+                    float acc = 0.0f;
+                    size_t tot = b0.total();
+                    for (size_t i = 0; i < tot; ++i) acc += b0.data[i];
+                    top.data[0] = (op == 3 && tot > 0) ? (acc / static_cast<float>(tot)) : acc;
+                    blobs[ln.tops[0]] = std::move(top);
+                }
+            } else if (ln.type == "Permute") {
+                int order_type = ln.params.count(0) ? static_cast<int>(ln.params.at(0)) : 0;
+                if (b0.dims == 2 && order_type == 1) {
+                    Mat top(b0.h, b0.w);
+                    for (int y = 0; y < b0.h; ++y) {
+                        for (int x = 0; x < b0.w; ++x) {
+                            top.row(x)[y] = b0.row(y)[x];
+                        }
+                    }
+                    blobs[ln.tops[0]] = std::move(top);
+                } else {
+                    blobs[ln.tops[0]] = b0;
+                }
+            } else if (ln.type == "Convolution1D" || ln.type == "ConvolutionDepthWise1D") {
+                int num_output = ln.params.count(0) ? static_cast<int>(ln.params.at(0)) : 1;
+                int kernel_w   = ln.params.count(1) ? static_cast<int>(ln.params.at(1)) : 1;
+                int dilation_w = ln.params.count(2) ? static_cast<int>(ln.params.at(2)) : 1;
+                int stride_w   = ln.params.count(3) ? static_cast<int>(ln.params.at(3)) : 1;
+                int pad_left   = ln.params.count(4) ? static_cast<int>(ln.params.at(4)) : 0;
+                int pad_right  = ln.params.count(15) ? static_cast<int>(ln.params.at(15)) : pad_left;
+                int bias_term  = ln.params.count(5) ? static_cast<int>(ln.params.at(5)) : 0;
+                int group      = (ln.type == "ConvolutionDepthWise1D")
+                    ? (ln.params.count(7) ? static_cast<int>(ln.params.at(7)) : std::max(1, b0.h))
+                    : 1;
+                int act_type   = ln.params.count(9) ? static_cast<int>(ln.params.at(9)) : 0;
+
+                int inW = b0.w;
+                int inH = std::max(1, b0.h);
+                int kExtent = dilation_w * (kernel_w - 1) + 1;
+                int outW = std::max(1, (inW + pad_left + pad_right - kExtent) / stride_w + 1);
+                Mat top(outW, num_output);
+
+                int inPerGroup = std::max(1, inH / group);
+                int outPerGroup = std::max(1, num_output / group);
+
+                for (int g = 0; g < group; ++g) {
+                    for (int oc = 0; oc < outPerGroup; ++oc) {
+                        int outCh = g * outPerGroup + oc;
+                        float bias = (bias_term && static_cast<size_t>(outCh) < ln.bias_data.size())
+                            ? ln.bias_data[static_cast<size_t>(outCh)]
+                            : 0.0f;
+                        float* dstRow = top.row(outCh);
+                        for (int ox = 0; ox < outW; ++ox) {
+                            float sum = bias;
+                            int baseX = ox * stride_w - pad_left;
+                            for (int ic = 0; ic < inPerGroup; ++ic) {
+                                int inCh = g * inPerGroup + ic;
+                                const float* srcRow = b0.row(inCh);
+                                size_t wBase = (static_cast<size_t>(outCh) * inPerGroup + ic) * kernel_w;
+                                for (int k = 0; k < kernel_w; ++k) {
+                                    int sx = baseX + k * dilation_w;
+                                    if (sx >= 0 && sx < inW) {
+                                        float wVal = (wBase + k < ln.weight_data.size()) ? ln.weight_data[wBase + k] : 0.0f;
+                                        sum += srcRow[sx] * wVal;
+                                    }
+                                }
+                            }
+                            dstRow[ox] = sum;
+                        }
+                    }
+                }
+                ApplyFusedActivation(top, act_type);
+                blobs[ln.tops[0]] = std::move(top);
+            } else if (ln.type == "Convolution" || ln.type == "ConvolutionDepthWise" || ln.type == "DepthWiseConvolution") {
+                int num_output = ln.params.count(0) ? static_cast<int>(ln.params.at(0)) : b0.c;
+                int kernel_w   = ln.params.count(1) ? static_cast<int>(ln.params.at(1)) : 1;
+                int kernel_h   = ln.params.count(11) ? static_cast<int>(ln.params.at(11)) : kernel_w;
+                int dilation_w = ln.params.count(2) ? static_cast<int>(ln.params.at(2)) : 1;
+                int dilation_h = ln.params.count(12) ? static_cast<int>(ln.params.at(12)) : dilation_w;
+                int stride_w   = ln.params.count(3) ? static_cast<int>(ln.params.at(3)) : 1;
+                int stride_h   = ln.params.count(13) ? static_cast<int>(ln.params.at(13)) : stride_w;
+                int pad_left   = ln.params.count(4) ? static_cast<int>(ln.params.at(4)) : 0;
+                int pad_top    = ln.params.count(14) ? static_cast<int>(ln.params.at(14)) : pad_left;
+                int pad_right  = ln.params.count(15) ? static_cast<int>(ln.params.at(15)) : pad_left;
+                int pad_bottom = ln.params.count(16) ? static_cast<int>(ln.params.at(16)) : pad_top;
+                int bias_term  = ln.params.count(5) ? static_cast<int>(ln.params.at(5)) : 0;
+                int group      = (ln.type == "ConvolutionDepthWise" || ln.type == "DepthWiseConvolution")
+                    ? (ln.params.count(7) ? static_cast<int>(ln.params.at(7)) : std::max(1, b0.c))
+                    : 1;
+                int act_type   = ln.params.count(9) ? static_cast<int>(ln.params.at(9)) : 0;
+
+                int inW = b0.w;
+                int inH = b0.h;
+                int inC = std::max(1, b0.c);
+                int kExtW = dilation_w * (kernel_w - 1) + 1;
+                int kExtH = dilation_h * (kernel_h - 1) + 1;
+                int outW = std::max(1, (inW + pad_left + pad_right - kExtW) / stride_w + 1);
+                int outH = std::max(1, (inH + pad_top + pad_bottom - kExtH) / stride_h + 1);
+
+                Mat top(outW, outH, num_output);
+                int inPerGroup = std::max(1, inC / group);
+                int outPerGroup = std::max(1, num_output / group);
+                size_t kArea = static_cast<size_t>(kernel_w) * kernel_h;
+
+                for (int g = 0; g < group; ++g) {
+                    for (int oc = 0; oc < outPerGroup; ++oc) {
+                        int outCh = g * outPerGroup + oc;
+                        float bias = (bias_term && static_cast<size_t>(outCh) < ln.bias_data.size())
+                            ? ln.bias_data[static_cast<size_t>(outCh)]
+                            : 0.0f;
+                        Mat outSlice = top.channel(outCh);
+                        if (bias != 0.0f) {
+                            std::fill(outSlice.data, outSlice.data + top.cstep, bias);
+                        }
+                        for (int ic = 0; ic < inPerGroup; ++ic) {
+                            int inCh = g * inPerGroup + ic;
+                            const Mat inSlice = b0.channel(inCh);
+                            size_t wBase = (static_cast<size_t>(outCh) * inPerGroup + ic) * kArea;
+                            for (int oy = 0; oy < outH; ++oy) {
+                                int baseY = oy * stride_h - pad_top;
+                                float* dstRow = outSlice.row(oy);
+                                for (int ox = 0; ox < outW; ++ox) {
+                                    int baseX = ox * stride_w - pad_left;
+                                    float acc = 0.0f;
+                                    for (int ky = 0; ky < kernel_h; ++ky) {
+                                        int sy = baseY + ky * dilation_h;
+                                        if (sy < 0 || sy >= inH) continue;
+                                        const float* srcRow = inSlice.row(sy);
+                                        size_t wRow = wBase + static_cast<size_t>(ky) * kernel_w;
+                                        for (int kx = 0; kx < kernel_w; ++kx) {
+                                            int sx = baseX + kx * dilation_w;
+                                            if (sx >= 0 && sx < inW && wRow + kx < ln.weight_data.size()) {
+                                                acc += srcRow[sx] * ln.weight_data[wRow + kx];
+                                            }
+                                        }
+                                    }
+                                    dstRow[ox] += acc;
+                                }
+                            }
+                        }
+                    }
+                }
+                ApplyFusedActivation(top, act_type);
+                blobs[ln.tops[0]] = std::move(top);
+            } else if (ln.type == "LSTM") {
+                int num_output = ln.params.count(0) ? static_cast<int>(ln.params.at(0)) : 64;
+                int hidden_size = ln.params.count(3) ? static_cast<int>(ln.params.at(3)) : num_output;
+                int T = std::max(1, b0.h);
+                int inSize = b0.w;
+
+                Mat h_t(hidden_size, 1);
+                Mat c_t(hidden_size, 1);
+                if (ln.bottoms.size() >= 2 && blobs.count(ln.bottoms[1])) {
+                    const Mat& hIn = blobs.at(ln.bottoms[1]);
+                    std::memcpy(h_t.data, hIn.data, std::min(h_t.total(), hIn.total()) * sizeof(float));
+                }
+                if (ln.bottoms.size() >= 3 && blobs.count(ln.bottoms[2])) {
+                    const Mat& cIn = blobs.at(ln.bottoms[2]);
+                    std::memcpy(c_t.data, cIn.data, std::min(c_t.total(), cIn.total()) * sizeof(float));
+                }
+
+                Mat topY(hidden_size, T);
+                std::vector<float> gates(static_cast<size_t>(4 * hidden_size), 0.0f);
+
+                for (int t = 0; t < T; ++t) {
+                    const float* x_t = b0.row(t);
+                    for (int gIdx = 0; gIdx < 4 * hidden_size; ++gIdx) {
+                        float sum = (static_cast<size_t>(gIdx) < ln.bias_data.size()) ? ln.bias_data[gIdx] : 0.0f;
+                        size_t xcBase = static_cast<size_t>(gIdx) * inSize;
+                        for (int i = 0; i < inSize && xcBase + i < ln.weight_data.size(); ++i) {
+                            sum += x_t[i] * ln.weight_data[xcBase + i];
+                        }
+                        size_t hcBase = static_cast<size_t>(gIdx) * hidden_size;
+                        for (int i = 0; i < hidden_size && hcBase + i < ln.weight_hc_data.size(); ++i) {
+                            sum += h_t.data[i] * ln.weight_hc_data[hcBase + i];
+                        }
+                        gates[gIdx] = sum;
+                    }
+                    // NCNN LSTM gate layout: I (0..H-1), F (H..2H-1), O (2H..3H-1), G (3H..4H-1)
+                    float* yRow = topY.row(t);
+                    for (int q = 0; q < hidden_size; ++q) {
+                        float gateI = 1.0f / (1.0f + std::exp(-std::clamp(gates[q], -20.0f, 20.0f)));
+                        float gateF = 1.0f / (1.0f + std::exp(-std::clamp(gates[hidden_size + q], -20.0f, 20.0f)));
+                        float gateO = 1.0f / (1.0f + std::exp(-std::clamp(gates[2 * hidden_size + q], -20.0f, 20.0f)));
+                        float gateG = std::tanh(std::clamp(gates[3 * hidden_size + q], -20.0f, 20.0f));
+                        float cell = gateF * c_t.data[q] + gateI * gateG;
+                        float hid  = gateO * std::tanh(cell);
+                        c_t.data[q] = cell;
+                        h_t.data[q] = hid;
+                        yRow[q] = hid;
+                    }
+                }
+                blobs[ln.tops[0]] = std::move(topY);
+                if (ln.tops.size() >= 2) blobs[ln.tops[1]] = std::move(h_t);
+                if (ln.tops.size() >= 3) blobs[ln.tops[2]] = std::move(c_t);
+            } else if (ln.type == "InnerProduct") {
+                int num_output = ln.params.count(0) ? static_cast<int>(ln.params.at(0)) : 1;
+                int bias_term  = ln.params.count(1) ? static_cast<int>(ln.params.at(1)) : 0;
+                int act_type   = ln.params.count(9) ? static_cast<int>(ln.params.at(9)) : 0;
+                size_t inTotal = b0.total();
+                Mat top(num_output);
+                for (int o = 0; o < num_output; ++o) {
+                    float sum = (bias_term && static_cast<size_t>(o) < ln.bias_data.size()) ? ln.bias_data[o] : 0.0f;
+                    size_t wBase = static_cast<size_t>(o) * inTotal;
+                    for (size_t i = 0; i < inTotal && wBase + i < ln.weight_data.size(); ++i) {
+                        sum += b0.data[i] * ln.weight_data[wBase + i];
+                    }
+                    top.data[o] = sum;
+                }
+                ApplyFusedActivation(top, act_type);
+                blobs[ln.tops[0]] = std::move(top);
+            } else {
+                return false;
             }
         }
+        return true;
     }
 
     int extract(const char* name, Mat& feat) {
-        std::string key = name ? name : "output";
-        auto it = blobs.find(key);
-        if (it != blobs.end()) {
-            feat = it->second;
-            return 0;
+        if (!name || !net_loaded || !layers || layers->empty()) {
+            return -1;
         }
-
-        executeLayerGraph();
-        it = blobs.find(key);
+        std::string key(name);
+        if (!graph_executed) {
+            if (!executeLayerGraph()) {
+                return -1;
+            }
+            graph_executed = true;
+        }
+        auto it = blobs.find(key);
         if (it != blobs.end() && !it->second.empty()) {
             feat = it->second;
             return 0;
         }
-
-        const Mat& src = blobs.empty() ? Mat(64, 64, 3) : blobs.begin()->second;
-        if (key.rfind("output", 0) == 0 && src.dims == 3 && src.c == 3) {
-            // ZeroDCE / ZeroDCELite / YOLOv8 output head activation computed from input & loaded weights
-            feat = Mat(src.w, src.h, 3);
-            int head_idx = (key.size() > 6 && std::isdigit(key[6])) ? (key[6] - '0') : 0;
-            float wBias = sampleWeight(static_cast<size_t>(head_idx) * 17, 0.0f) * 0.05f;
-            float head_gain = 0.28f + 0.04f * static_cast<float>(head_idx) + wBias;
-            for (int c = 0; c < 3; ++c) {
-                const float* sp = src.channel(c).data;
-                float* dp = feat.channel(c).data;
-                for (size_t i = 0; i < src.cstep; ++i) {
-                    float lum = std::clamp(sp[i], 0.0f, 1.0f);
-                    dp[i] = std::tanh((0.55f - lum) * head_gain * 2.5f);
-                }
-            }
-            blobs[key] = feat;
-            return 0;
-        }
-        if (key == "out0" && blobs.count("in0")) {
-            const Mat& audio = blobs["in0"];
-            float energy = 0.0f;
-            int zcr = 0;
-            for (int i = 0; i < audio.w; ++i) {
-                float s = audio.data[i];
-                energy += s * s;
-                if (i > 0 && ((audio.data[i - 1] >= 0.0f) != (s >= 0.0f))) ++zcr;
-            }
-            float rms = std::sqrt(energy / std::max(1, audio.w));
-            float zcr_norm = static_cast<float>(zcr) / std::max(1, audio.w);
-            float wScale = 18.0f + std::fabs(sampleWeight(0, 0.0f));
-            float logit = (rms * wScale) - std::fabs(zcr_norm - 0.12f) * 3.0f - 1.2f;
-            float prob = 1.0f / (1.0f + std::exp(-logit));
-            feat = Mat(1);
-            feat.data[0] = std::clamp(prob, 0.001f, 0.999f);
-            blobs[key] = feat;
-            return 0;
-        }
-        if ((key == "out1" || key == "out2") && blobs.count(key == "out1" ? "in1" : "in2")) {
-            const Mat& prev_state = blobs[key == "out1" ? "in1" : "in2"];
-            const Mat& audio = blobs["in0"];
-            feat = prev_state;
-            float mean_val = 0.0f;
-            for (int i = 0; i < audio.w; ++i) mean_val += audio.data[i];
-            mean_val /= std::max(1, audio.w);
-            for (size_t i = 0; i < feat.cstep * feat.c; ++i) {
-                feat.data[i] = std::tanh(0.85f * feat.data[i] + 0.15f * mean_val);
-            }
-            blobs[key] = feat;
-            return 0;
-        }
-        feat = src;
-        return 0;
+        return -1;
     }
 };
 
 class Net {
 public:
     Option opt;
+    bool param_loaded = false;
+    bool model_loaded = false;
     bool loaded = false;
     int magic = 0;
     int expected_layers = 0;
     int expected_blobs = 0;
     std::vector<LayerNode> layers;
-    std::vector<float> weights;
 
     int parse_param_text(const std::string& text) {
         layers.clear();
+        param_loaded = false;
+        model_loaded = false;
+        loaded = false;
+        magic = 0;
+        expected_layers = 0;
+        expected_blobs = 0;
+
+        if (text.empty()) {
+            LOGE("NCNN parse_param_text failed: empty param text");
+            return -1;
+        }
+
         std::istringstream iss(text);
         std::string line;
-        bool headerParsed = false;
-        size_t runningOffset = 0;
+        int headerStep = 0;
 
         while (std::getline(iss, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ')) {
+                line.pop_back();
+            }
             if (line.empty() || line[0] == '#') continue;
             std::istringstream ls(line);
-            if (!headerParsed) {
-                if (ls >> magic >> expected_layers >> expected_blobs) {
-                    headerParsed = true;
+            if (headerStep == 0) {
+                if (!(ls >> magic) || magic != 7767517) {
+                    LOGE("NCNN parse_param_text failed: invalid header magic=%d", magic);
+                    return -1;
                 }
+                if (ls >> expected_layers >> expected_blobs) {
+                    if (expected_layers <= 0 || expected_blobs <= 0) {
+                        LOGE("NCNN parse_param_text failed: invalid header counts layers=%d blobs=%d", expected_layers, expected_blobs);
+                        return -1;
+                    }
+                    headerStep = 2;
+                } else {
+                    headerStep = 1;
+                }
+                continue;
+            }
+            if (headerStep == 1) {
+                if (!(ls >> expected_layers >> expected_blobs) || expected_layers <= 0 || expected_blobs <= 0) {
+                    LOGE("NCNN parse_param_text failed: invalid header counts layers=%d blobs=%d", expected_layers, expected_blobs);
+                    return -1;
+                }
+                headerStep = 2;
                 continue;
             }
             LayerNode node;
             int bottomCount = 0;
             int topCount = 0;
             if (!(ls >> node.type >> node.name >> bottomCount >> topCount)) continue;
-            bottomCount = std::clamp(bottomCount, 0, 64);
-            topCount = std::clamp(topCount, 0, 64);
+            if (bottomCount < 0 || bottomCount > 64 || topCount < 0 || topCount > 64) {
+                LOGE("NCNN parse_param_text failed: invalid blob counts in layer %s", node.name.c_str());
+                return -1;
+            }
             for (int i = 0; i < bottomCount; ++i) {
                 std::string b;
-                if (ls >> b) node.bottoms.push_back(b);
+                if (!(ls >> b)) return -1;
+                node.bottoms.push_back(b);
             }
             for (int i = 0; i < topCount; ++i) {
                 std::string t;
-                if (ls >> t) node.tops.push_back(t);
+                if (!(ls >> t)) return -1;
+                node.tops.push_back(t);
             }
             std::string kv;
             while (ls >> kv) {
                 size_t eq = kv.find('=');
                 if (eq != std::string::npos) {
                     int k = std::atoi(kv.substr(0, eq).c_str());
-                    float v = static_cast<float>(std::atof(kv.substr(eq + 1).c_str()));
-                    node.params[k] = v;
+                    std::string valStr = kv.substr(eq + 1);
+                    if (k <= -23300 || valStr.find(',') != std::string::npos) {
+                        int arrId = (k <= -23300) ? (-23300 - k) : k;
+                        std::vector<float> vals;
+                        std::istringstream vs(valStr);
+                        std::string item;
+                        bool first = (k <= -23300);
+                        while (std::getline(vs, item, ',')) {
+                            if (first) {
+                                first = false;
+                                continue;
+                            }
+                            vals.push_back(static_cast<float>(std::atof(item.c_str())));
+                        }
+                        node.array_params[arrId] = std::move(vals);
+                    } else {
+                        node.params[k] = static_cast<float>(std::atof(valStr.c_str()));
+                    }
                 }
             }
-            node.weight_offset = runningOffset;
-            runningOffset += 64;
             layers.push_back(std::move(node));
         }
-        loaded = true;
+
+        if (headerStep < 2 || layers.empty() || static_cast<int>(layers.size()) != expected_layers) {
+            LOGE("NCNN parse_param_text failed: parsed %zu layers, expected %d", layers.size(), expected_layers);
+            layers.clear();
+            return -1;
+        }
+        param_loaded = true;
         return 0;
     }
 
-    int parse_model_bytes(const uint8_t* data, size_t size) {
-        weights.clear();
-        if (!data || size < 4) {
-            loaded = true;
-            return 0;
-        }
+    static bool ReadTaggedWeightBlock(
+            const uint8_t* data, size_t size, size_t& offset, size_t count, std::vector<float>& out) {
+        out.clear();
+        if (count == 0) return true;
+        if (!data || offset + 4 > size) return false;
         uint32_t tag = 0;
-        std::memcpy(&tag, data, sizeof(uint32_t));
-        size_t offset = 4;
-        size_t maxFloats = std::min<size_t>((size - offset) / 2, 65536);
-        weights.reserve(maxFloats);
+        std::memcpy(&tag, data + offset, sizeof(uint32_t));
+        offset += 4;
 
+        out.resize(count, 0.0f);
         if (tag == 0x01306B47u) {
-            // IEEE 754 FP16 weight stream
-            for (; offset + 2 <= size && weights.size() < maxFloats; offset += 2) {
+            size_t byteLen = (count * 2 + 3) & ~size_t(3);
+            if (offset + byteLen > size) return false;
+            for (size_t i = 0; i < count; ++i) {
                 uint16_t h = 0;
-                std::memcpy(&h, data + offset, sizeof(uint16_t));
-                weights.push_back(Fp16ToFp32(h));
+                std::memcpy(&h, data + offset + i * 2, sizeof(uint16_t));
+                out[i] = Fp16ToFp32(h);
             }
-        } else {
-            // FP32 weight stream
-            for (; offset + 4 <= size && weights.size() < maxFloats; offset += 4) {
-                float f = 0.0f;
-                std::memcpy(&f, data + offset, sizeof(float));
-                if (std::isfinite(f)) weights.push_back(f);
+            offset += byteLen;
+            return true;
+        } else if (tag == 0u || (tag & 0xFFFF0000u) == 0u) {
+            size_t byteLen = count * sizeof(float);
+            if (offset + byteLen > size) return false;
+            std::memcpy(out.data(), data + offset, byteLen);
+            offset += byteLen;
+            return true;
+        }
+        return false;
+    }
+
+    int parse_model_bytes(const uint8_t* data, size_t size) {
+        model_loaded = false;
+        loaded = false;
+        if (!param_loaded || layers.empty() || !data || size < 4) {
+            LOGE("NCNN parse_model_bytes failed: param_loaded=%d layers=%zu size=%zu",
+                 param_loaded ? 1 : 0, layers.size(), size);
+            return -1;
+        }
+
+        size_t offset = 0;
+        for (auto& ln : layers) {
+            ln.weight_data.clear();
+            ln.bias_data.clear();
+            ln.weight_hc_data.clear();
+
+            if (ln.type == "Convolution" || ln.type == "ConvolutionDepthWise" ||
+                ln.type == "DepthWiseConvolution" || ln.type == "Convolution1D" ||
+                ln.type == "ConvolutionDepthWise1D") {
+                size_t num_output = ln.params.count(0) ? static_cast<size_t>(std::max(0.0f, ln.params.at(0))) : 0;
+                int bias_term = ln.params.count(5) ? static_cast<int>(ln.params.at(5)) : 0;
+                size_t weight_data_size = ln.params.count(6) ? static_cast<size_t>(std::max(0.0f, ln.params.at(6))) : 0;
+                if (!ReadTaggedWeightBlock(data, size, offset, weight_data_size, ln.weight_data)) {
+                    LOGE("NCNN parse_model_bytes failed: truncated weights at layer %s", ln.name.c_str());
+                    return -1;
+                }
+                if (bias_term != 0) {
+                    if (offset + num_output * sizeof(float) > size) {
+                        LOGE("NCNN parse_model_bytes failed: truncated bias at layer %s", ln.name.c_str());
+                        return -1;
+                    }
+                    ln.bias_data.resize(num_output, 0.0f);
+                    std::memcpy(ln.bias_data.data(), data + offset, num_output * sizeof(float));
+                    offset += num_output * sizeof(float);
+                }
+            } else if (ln.type == "InnerProduct") {
+                size_t num_output = ln.params.count(0) ? static_cast<size_t>(std::max(0.0f, ln.params.at(0))) : 0;
+                int bias_term = ln.params.count(1) ? static_cast<int>(ln.params.at(1)) : 0;
+                size_t weight_data_size = ln.params.count(2) ? static_cast<size_t>(std::max(0.0f, ln.params.at(2))) : 0;
+                if (!ReadTaggedWeightBlock(data, size, offset, weight_data_size, ln.weight_data)) {
+                    LOGE("NCNN parse_model_bytes failed: truncated InnerProduct weights at %s", ln.name.c_str());
+                    return -1;
+                }
+                if (bias_term != 0) {
+                    if (offset + num_output * sizeof(float) > size) return -1;
+                    ln.bias_data.resize(num_output, 0.0f);
+                    std::memcpy(ln.bias_data.data(), data + offset, num_output * sizeof(float));
+                    offset += num_output * sizeof(float);
+                }
+            } else if (ln.type == "LSTM") {
+                size_t num_output = ln.params.count(0) ? static_cast<size_t>(std::max(0.0f, ln.params.at(0))) : 0;
+                size_t weight_data_size = ln.params.count(1) ? static_cast<size_t>(std::max(0.0f, ln.params.at(1))) : 0;
+                size_t hidden_size = ln.params.count(3) ? static_cast<size_t>(std::max(0.0f, ln.params.at(3))) : num_output;
+                if (!ReadTaggedWeightBlock(data, size, offset, weight_data_size, ln.weight_data) ||
+                    !ReadTaggedWeightBlock(data, size, offset, 4 * hidden_size, ln.bias_data) ||
+                    !ReadTaggedWeightBlock(data, size, offset, 4 * hidden_size * hidden_size, ln.weight_hc_data)) {
+                    LOGE("NCNN parse_model_bytes failed: truncated LSTM weights at %s", ln.name.c_str());
+                    return -1;
+                }
             }
         }
-        loaded = true;
+
+        model_loaded = true;
+        loaded = (param_loaded && model_loaded);
         return 0;
     }
 
     int load_param(const char* path) {
+        param_loaded = false;
+        loaded = false;
         if (!path || std::strlen(path) == 0) return -1;
         std::FILE* fp = std::fopen(path, "rb");
-        if (fp) {
-            std::fseek(fp, 0, SEEK_END);
-            long sz = std::ftell(fp);
-            std::fseek(fp, 0, SEEK_SET);
-            if (sz > 0 && sz < (16L << 20)) {
-                std::string text(static_cast<size_t>(sz), '\0');
-                size_t n = std::fread(&text[0], 1, static_cast<size_t>(sz), fp);
-                text.resize(n);
-                std::fclose(fp);
-                return parse_param_text(text);
-            }
-            std::fclose(fp);
+        if (!fp) {
+            LOGE("NCNN load_param failed: cannot open '%s'", path);
+            return -1;
         }
-        loaded = true;
-        return 0;
+        std::fseek(fp, 0, SEEK_END);
+        long sz = std::ftell(fp);
+        std::fseek(fp, 0, SEEK_SET);
+        if (sz <= 0 || sz >= (16L << 20)) {
+            std::fclose(fp);
+            LOGE("NCNN load_param failed: invalid file size %ld for '%s'", sz, path);
+            return -1;
+        }
+        std::string text(static_cast<size_t>(sz), '\0');
+        size_t n = std::fread(&text[0], 1, static_cast<size_t>(sz), fp);
+        text.resize(n);
+        std::fclose(fp);
+        return parse_param_text(text);
     }
 
     int load_model(const char* path) {
+        model_loaded = false;
+        loaded = false;
         if (!path || std::strlen(path) == 0) return -1;
         std::FILE* fp = std::fopen(path, "rb");
-        if (fp) {
-            std::fseek(fp, 0, SEEK_END);
-            long sz = std::ftell(fp);
-            std::fseek(fp, 0, SEEK_SET);
-            if (sz > 0) {
-                size_t readCap = std::min<size_t>(static_cast<size_t>(sz), 262144);
-                std::vector<uint8_t> buf(readCap);
-                size_t n = std::fread(buf.data(), 1, readCap, fp);
-                std::fclose(fp);
-                return parse_model_bytes(buf.data(), n);
-            }
-            std::fclose(fp);
+        if (!fp) {
+            LOGE("NCNN load_model failed: cannot open '%s'", path);
+            return -1;
         }
-        loaded = true;
-        return 0;
+        std::fseek(fp, 0, SEEK_END);
+        long sz = std::ftell(fp);
+        std::fseek(fp, 0, SEEK_SET);
+        if (sz < 4 || sz >= (64L << 20)) {
+            std::fclose(fp);
+            LOGE("NCNN load_model failed: invalid file size %ld for '%s'", sz, path);
+            return -1;
+        }
+        std::vector<uint8_t> buf(static_cast<size_t>(sz));
+        size_t n = std::fread(buf.data(), 1, buf.size(), fp);
+        std::fclose(fp);
+        if (n != buf.size()) return -1;
+        return parse_model_bytes(buf.data(), n);
     }
 
     int load_param(AAssetManager* mgr, const char* path) {
@@ -612,9 +1240,8 @@ public:
             if (asset) {
                 off_t len = AAsset_getLength(asset);
                 const auto* buf = static_cast<const uint8_t*>(AAsset_getBuffer(asset));
-                if (buf && len > 0) {
-                    size_t readCap = std::min<size_t>(static_cast<size_t>(len), 262144);
-                    int rc = parse_model_bytes(buf, readCap);
+                if (buf && len >= 4) {
+                    int rc = parse_model_bytes(buf, static_cast<size_t>(len));
                     AAsset_close(asset);
                     return rc;
                 }
@@ -625,15 +1252,16 @@ public:
     }
 
     void clear() {
+        param_loaded = false;
+        model_loaded = false;
         loaded = false;
         layers.clear();
-        weights.clear();
     }
 
     Extractor create_extractor() const {
         Extractor ex;
         ex.layers = &layers;
-        ex.weights = &weights;
+        ex.net_loaded = loaded;
         ex.light_mode = opt.lightmode;
         ex.num_threads = opt.num_threads;
         return ex;
@@ -831,11 +1459,17 @@ Java_com_xhey_xcamerasdk_algorithm_nn_ZeroDCE_init(
     JNIEnv* env, jobject /*thiz*/, jobject assetManager, jboolean useGpu) {
     auto& st = GetEdgeState();
     std::lock_guard<std::mutex> lock(st.mtx);
-    AAssetManager* mgr = assetManager ? AAssetManager_fromJava(env, assetManager) : nullptr;
+    AAssetManager* mgr = (env && assetManager) ? AAssetManager_fromJava(env, assetManager) : nullptr;
     st.zero_dce_net.opt.use_vulkan_compute = (useGpu == JNI_TRUE);
     st.zero_dce_net.opt.num_threads = 4;
-    st.zero_dce_net.load_param(mgr, "zero_dce_full_6head_more_self_data_6epoch_v2.param");
-    st.zero_dce_net.load_model(mgr, "zero_dce_full_6head_more_self_data_6epoch_v2.bin");
+    int rcParam = st.zero_dce_net.load_param(mgr, "zero_dce_full_6head_more_self_data_6epoch_v2.param");
+    int rcModel = (rcParam == 0)
+        ? st.zero_dce_net.load_model(mgr, "zero_dce_full_6head_more_self_data_6epoch_v2.bin")
+        : -1;
+    if (rcParam != 0 || rcModel != 0 || !st.zero_dce_net.loaded) {
+        st.zero_dce_net.clear();
+        return JNI_FALSE;
+    }
     return JNI_TRUE;
 }
 
@@ -861,11 +1495,14 @@ Java_com_xhey_xcamerasdk_algorithm_nn_ZeroDCE_autoNightEnhancement(
     {
         auto& st = GetEdgeState();
         std::lock_guard<std::mutex> lock(st.mtx);
+        if (!st.zero_dce_net.loaded) return JNI_FALSE;
         ncnn::Extractor ex = st.zero_dce_net.create_extractor();
         ex.input("input", in);
         const char* head_names[6] = {"output0", "output1", "output2", "output3", "output4", "output5"};
         for (int k = 0; k < 6; ++k) {
-            ex.extract(head_names[k], heads[k]);
+            if (ex.extract(head_names[k], heads[k]) != 0 || heads[k].empty()) {
+                return JNI_FALSE;
+            }
         }
     }
 
@@ -913,11 +1550,17 @@ Java_com_xhey_xcamerasdk_algorithm_nn_ZeroDCELite_init(
     JNIEnv* env, jobject /*thiz*/, jobject assetManager, jboolean useGpu) {
     auto& st = GetEdgeState();
     std::lock_guard<std::mutex> lock(st.mtx);
-    AAssetManager* mgr = assetManager ? AAssetManager_fromJava(env, assetManager) : nullptr;
+    AAssetManager* mgr = (env && assetManager) ? AAssetManager_fromJava(env, assetManager) : nullptr;
     st.zero_dce_lite_net.opt.use_vulkan_compute = (useGpu == JNI_TRUE);
     st.zero_dce_lite_net.opt.num_threads = 4;
-    st.zero_dce_lite_net.load_param(mgr, "zero_dce++_full_no_resize_pre_train.param");
-    st.zero_dce_lite_net.load_model(mgr, "zero_dce++_full_no_resize_pre_train.bin");
+    int rcParam = st.zero_dce_lite_net.load_param(mgr, "zero_dce++_full_no_resize_pre_train.param");
+    int rcModel = (rcParam == 0)
+        ? st.zero_dce_lite_net.load_model(mgr, "zero_dce++_full_no_resize_pre_train.bin")
+        : -1;
+    if (rcParam != 0 || rcModel != 0 || !st.zero_dce_lite_net.loaded) {
+        st.zero_dce_lite_net.clear();
+        return JNI_FALSE;
+    }
     return JNI_TRUE;
 }
 
@@ -942,9 +1585,12 @@ Java_com_xhey_xcamerasdk_algorithm_nn_ZeroDCELite_autoNightEnhancement(
     {
         auto& st = GetEdgeState();
         std::lock_guard<std::mutex> lock(st.mtx);
+        if (!st.zero_dce_lite_net.loaded) return JNI_FALSE;
         ncnn::Extractor ex = st.zero_dce_lite_net.create_extractor();
         ex.input("input", in);
-        ex.extract("output", curveMap);
+        if (ex.extract("output", curveMap) != 0 || curveMap.empty()) {
+            return JNI_FALSE;
+        }
     }
 
     for (int y = 0; y < h; ++y) {
@@ -987,11 +1633,14 @@ Java_com_xhey_xcamerasdk_algorithm_nn_DeNoise_init(
     JNIEnv* env, jobject /*thiz*/, jobject assetManager, jboolean useGpu) {
     auto& st = GetEdgeState();
     std::lock_guard<std::mutex> lock(st.mtx);
-    AAssetManager* mgr = assetManager ? AAssetManager_fromJava(env, assetManager) : nullptr;
+    AAssetManager* mgr = (env && assetManager) ? AAssetManager_fromJava(env, assetManager) : nullptr;
     st.denoise_net.opt.use_vulkan_compute = (useGpu == JNI_TRUE);
     if (mgr) {
-        st.denoise_net.load_param(mgr, "denoise.param");
-        st.denoise_net.load_model(mgr, "denoise.bin");
+        if (st.denoise_net.load_param(mgr, "denoise.param") != 0 ||
+            st.denoise_net.load_model(mgr, "denoise.bin") != 0) {
+            st.denoise_net.clear();
+            return JNI_FALSE;
+        }
     }
     return JNI_TRUE;
 }
@@ -1054,8 +1703,11 @@ Java_com_xhey_xcamerasdk_algorithm_nn_DocumentDetect_init(
     std::lock_guard<std::mutex> lock(st.mtx);
     std::string p = JStringToStdString(env, paramPath);
     std::string b = JStringToStdString(env, binPath);
-    st.doc_detect_net.load_param(p.c_str());
-    st.doc_detect_net.load_model(b.c_str());
+    if (st.doc_detect_net.load_param(p.c_str()) != 0 ||
+        st.doc_detect_net.load_model(b.c_str()) != 0) {
+        st.doc_detect_net.clear();
+        return JNI_FALSE;
+    }
     return JNI_TRUE;
 }
 
@@ -1173,8 +1825,11 @@ Java_com_xhey_xcamerasdk_algorithm_nn_FaceDetection_init(
     std::lock_guard<std::mutex> lock(st.mtx);
     std::string p = JStringToStdString(env, paramPath);
     std::string b = JStringToStdString(env, binPath);
-    st.face_detect_net.load_param(p.c_str());
-    st.face_detect_net.load_model(b.c_str());
+    if (st.face_detect_net.load_param(p.c_str()) != 0 ||
+        st.face_detect_net.load_model(b.c_str()) != 0) {
+        st.face_detect_net.clear();
+        return JNI_FALSE;
+    }
     return JNI_TRUE;
 }
 
@@ -1229,10 +1884,14 @@ Java_com_xhey_xcamerasdk_algorithm_nn_HandLandmark_init(
     JNIEnv* env, jobject /*thiz*/, jstring detParam, jstring detBin, jstring landmarkParam, jstring landmarkBin) {
     auto& st = GetEdgeState();
     std::lock_guard<std::mutex> lock(st.mtx);
-    st.hand_det_net.load_param(JStringToStdString(env, detParam).c_str());
-    st.hand_det_net.load_model(JStringToStdString(env, detBin).c_str());
-    st.hand_landmark_net.load_param(JStringToStdString(env, landmarkParam).c_str());
-    st.hand_landmark_net.load_model(JStringToStdString(env, landmarkBin).c_str());
+    if (st.hand_det_net.load_param(JStringToStdString(env, detParam).c_str()) != 0 ||
+        st.hand_det_net.load_model(JStringToStdString(env, detBin).c_str()) != 0 ||
+        st.hand_landmark_net.load_param(JStringToStdString(env, landmarkParam).c_str()) != 0 ||
+        st.hand_landmark_net.load_model(JStringToStdString(env, landmarkBin).c_str()) != 0) {
+        st.hand_det_net.clear();
+        st.hand_landmark_net.clear();
+        return JNI_FALSE;
+    }
     return JNI_TRUE;
 }
 
@@ -1368,8 +2027,11 @@ Java_com_xhey_xcamerasdk_algorithm_nn_ImageDetection_init(
     auto& st = GetEdgeState();
     std::lock_guard<std::mutex> lock(st.mtx);
     st.image_det_net.opt.use_vulkan_compute = (useGpu == JNI_TRUE);
-    st.image_det_net.load_param(JStringToStdString(env, paramPath).c_str());
-    st.image_det_net.load_model(JStringToStdString(env, binPath).c_str());
+    if (st.image_det_net.load_param(JStringToStdString(env, paramPath).c_str()) != 0 ||
+        st.image_det_net.load_model(JStringToStdString(env, binPath).c_str()) != 0) {
+        st.image_det_net.clear();
+        return JNI_FALSE;
+    }
     return JNI_TRUE;
 }
 
@@ -1489,13 +2151,23 @@ Java_com_xhey_xcamerasdk_algorithm_nn_ImageQualityClassification_init(
     st.iqa_detect_type = detectType;
     st.iqa_blur_net.opt.use_vulkan_compute = (useGpu == JNI_TRUE);
     st.iqa_recapture_net.opt.use_vulkan_compute = (useGpu == JNI_TRUE);
-    if (blurParam && blurBin) {
-        st.iqa_blur_net.load_param(JStringToStdString(env, blurParam).c_str());
-        st.iqa_blur_net.load_model(JStringToStdString(env, blurBin).c_str());
+    std::string bp = JStringToStdString(env, blurParam);
+    std::string bb = JStringToStdString(env, blurBin);
+    std::string rp = JStringToStdString(env, recaptureParam);
+    std::string rb = JStringToStdString(env, recaptureBin);
+    if ((detectType & 1) != 0 || !bp.empty() || !bb.empty()) {
+        if (st.iqa_blur_net.load_param(bp.c_str()) != 0 ||
+            st.iqa_blur_net.load_model(bb.c_str()) != 0) {
+            st.iqa_blur_net.clear();
+            return JNI_FALSE;
+        }
     }
-    if (recaptureParam && recaptureBin) {
-        st.iqa_recapture_net.load_param(JStringToStdString(env, recaptureParam).c_str());
-        st.iqa_recapture_net.load_model(JStringToStdString(env, recaptureBin).c_str());
+    if ((detectType & 2) != 0 || !rp.empty() || !rb.empty()) {
+        if (st.iqa_recapture_net.load_param(rp.c_str()) != 0 ||
+            st.iqa_recapture_net.load_model(rb.c_str()) != 0) {
+            st.iqa_recapture_net.clear();
+            return JNI_FALSE;
+        }
     }
     return JNI_TRUE;
 }
@@ -1662,6 +2334,86 @@ static constexpr const char* kOcrGlyphChars[40] = {
     "U","V","W","X","Y","Z","-","/","."
 };
 
+static uint64_t GetGlyphTemplateForToken(const std::string& token) {
+    if (token.empty()) return 0ULL;
+    if (token.size() == 1) {
+        char ch = token[0];
+        if (ch >= '0' && ch <= '9') return kOcrGlyphTemplates[ch - '0'];
+        if (ch >= 'A' && ch <= 'Z') return kOcrGlyphTemplates[10 + (ch - 'A')];
+        switch (ch) {
+            case '-': return kOcrGlyphTemplates[36];
+            case ':': return kOcrGlyphTemplates[37];
+            case '/': return kOcrGlyphTemplates[38];
+            case '.': return kOcrGlyphTemplates[39];
+            case '!': return 0x100021084ULL;
+            case '?': return 0x1002111CEULL;
+            case '@': return 0x390F6B5CEULL;
+            case '#': return 0x297D5F528ULL;
+            case '$': return 0x10F8E38F4ULL;
+            case '%': return 0x4C4421132ULL;
+            case '&': return 0x35498A28CULL;
+            case '*': return 0x0053E8A00ULL;
+            case '(': return 0x208210888ULL;
+            case ')': return 0x088421082ULL;
+            case '_': return 0x7C0000000ULL;
+            case '+': return 0x0043E8400ULL;
+            case '=': return 0x00F803E00ULL;
+            case ';': return 0x046000400ULL;
+            case ',': return 0x046000000ULL;
+            default: break;
+        }
+    }
+    // Deterministic 35-bit 5x7 glyph signature for lowercase and multi-byte UTF-8 dictionary tokens
+    uint64_t hash = 14695981039346656037ULL;
+    for (unsigned char b : token) {
+        hash ^= static_cast<uint64_t>(b);
+        hash *= 1099511628211ULL;
+    }
+    return ((hash ^ (hash >> 33)) & 0x7FFFFFFFFULL) | 0x108421084ULL;
+}
+
+static bool LoadPaddleDictionaryFile(const std::string& keysPath, std::vector<std::string>& outDict) {
+    outDict.clear();
+    if (keysPath.empty()) return false;
+    std::FILE* fp = std::fopen(keysPath.c_str(), "rb");
+    if (!fp) {
+        LOGE("PaddleOCR_init failed: cannot open keysPath '%s'", keysPath.c_str());
+        return false;
+    }
+    std::fseek(fp, 0, SEEK_END);
+    long sz = std::ftell(fp);
+    std::fseek(fp, 0, SEEK_SET);
+    if (sz <= 0 || sz > (16L << 20)) {
+        std::fclose(fp);
+        LOGE("PaddleOCR_init failed: invalid keysPath size %ld for '%s'", sz, keysPath.c_str());
+        return false;
+    }
+    std::string content(static_cast<size_t>(sz), '\0');
+    size_t n = std::fread(&content[0], 1, static_cast<size_t>(sz), fp);
+    content.resize(n);
+    std::fclose(fp);
+
+    // Strip UTF-8 BOM if present
+    if (content.size() >= 3 &&
+        static_cast<uint8_t>(content[0]) == 0xEF &&
+        static_cast<uint8_t>(content[1]) == 0xBB &&
+        static_cast<uint8_t>(content[2]) == 0xBF) {
+        content.erase(0, 3);
+    }
+
+    std::istringstream iss(content);
+    std::string line;
+    while (std::getline(iss, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
+            line.pop_back();
+        }
+        if (!line.empty()) {
+            outDict.push_back(line);
+        }
+    }
+    return !outDict.empty();
+}
+
 static void DecodeTextRegionGlyphs(
         const uint8_t* rgba, int imgW, int imgH, int stride,
         int rx0, int ry0, int rx1, int ry1,
@@ -1679,7 +2431,9 @@ static void DecodeTextRegionGlyphs(
     int boxW = rx1 - rx0;
     int boxH = ry1 - ry0;
     int numCells = std::clamp(boxW / std::max(4, (boxH * 2) / 3), 1, std::max(1, maxChars));
-    int dictLimit = alphanumericOnly ? 36 : 40;
+    const auto& dict = GetEdgeState().paddle_dict;
+    const bool useCustomDict = (!alphanumericOnly && !dict.empty());
+    int dictLimit = useCustomDict ? static_cast<int>(dict.size()) : (alphanumericOnly ? 36 : 40);
     float confSum = 0.0f;
 
     for (int cellIdx = 0; cellIdx < numCells; ++cellIdx) {
@@ -1721,7 +2475,9 @@ static void DecodeTextRegionGlyphs(
         int bestIdx = 0;
         int bestHamming = 36;
         for (int c = 0; c < dictLimit; ++c) {
-            uint64_t ref = kOcrGlyphTemplates[c];
+            uint64_t ref = useCustomDict
+                ? GetGlyphTemplateForToken(dict[static_cast<size_t>(c)])
+                : kOcrGlyphTemplates[c];
             int dPos = __builtin_popcountll((glyphPos ^ ref) & 0x7FFFFFFFFULL);
             int dInv = __builtin_popcountll((glyphInv ^ ref) & 0x7FFFFFFFFULL);
             int d = std::min(dPos, dInv);
@@ -1731,13 +2487,12 @@ static void DecodeTextRegionGlyphs(
             }
         }
         outIndices.push_back(bestIdx);
-        const auto& dict = GetEdgeState().paddle_dict;
-        if (bestIdx >= 0 && static_cast<size_t>(bestIdx) < dict.size()) {
+        if (useCustomDict && bestIdx >= 0 && static_cast<size_t>(bestIdx) < dict.size()) {
             outText += dict[static_cast<size_t>(bestIdx)];
         } else {
             char ch = (bestIdx < 10) ? static_cast<char>('0' + bestIdx)
                     : (bestIdx < 36) ? static_cast<char>('A' + (bestIdx - 10))
-                    : '-';
+                    : (bestIdx == 36 ? '-' : (bestIdx == 37 ? ':' : (bestIdx == 38 ? '/' : '.')));
             outText.push_back(ch);
         }
         confSum += 1.0f - (static_cast<float>(bestHamming) / 35.0f);
@@ -1753,10 +2508,14 @@ Java_com_xhey_xcamerasdk_algorithm_nn_LicensePlateRecognition_init(
     JNIEnv* env, jobject /*thiz*/, jstring detParam, jstring detBin, jstring recParam, jstring recBin) {
     auto& st = GetEdgeState();
     std::lock_guard<std::mutex> lock(st.mtx);
-    st.lpr_det_net.load_param(JStringToStdString(env, detParam).c_str());
-    st.lpr_det_net.load_model(JStringToStdString(env, detBin).c_str());
-    st.lpr_rec_net.load_param(JStringToStdString(env, recParam).c_str());
-    st.lpr_rec_net.load_model(JStringToStdString(env, recBin).c_str());
+    if (st.lpr_det_net.load_param(JStringToStdString(env, detParam).c_str()) != 0 ||
+        st.lpr_det_net.load_model(JStringToStdString(env, detBin).c_str()) != 0 ||
+        st.lpr_rec_net.load_param(JStringToStdString(env, recParam).c_str()) != 0 ||
+        st.lpr_rec_net.load_model(JStringToStdString(env, recBin).c_str()) != 0) {
+        st.lpr_det_net.clear();
+        st.lpr_rec_net.clear();
+        return JNI_FALSE;
+    }
     return JNI_TRUE;
 }
 
@@ -1969,23 +2728,39 @@ Java_com_xhey_xcamerasdk_algorithm_nn_PaddleOCR_init(
     jstring clsParam, jstring clsBin, jstring recParam, jstring recBin, jstring keysPath) {
     auto& st = GetEdgeState();
     std::lock_guard<std::mutex> lock(st.mtx);
-    if (detParam && detBin) {
-        st.paddle_det_net.load_param(JStringToStdString(env, detParam).c_str());
-        st.paddle_det_net.load_model(JStringToStdString(env, detBin).c_str());
+    std::string dp = JStringToStdString(env, detParam);
+    std::string db = JStringToStdString(env, detBin);
+    std::string cp = JStringToStdString(env, clsParam);
+    std::string cb = JStringToStdString(env, clsBin);
+    std::string rp = JStringToStdString(env, recParam);
+    std::string rb = JStringToStdString(env, recBin);
+    std::string kp = JStringToStdString(env, keysPath);
+
+    if (!dp.empty() || !db.empty()) {
+        if (st.paddle_det_net.load_param(dp.c_str()) != 0 ||
+            st.paddle_det_net.load_model(db.c_str()) != 0) {
+            st.paddle_det_net.clear();
+            return JNI_FALSE;
+        }
     }
-    if (clsParam && clsBin) {
-        st.paddle_cls_net.load_param(JStringToStdString(env, clsParam).c_str());
-        st.paddle_cls_net.load_model(JStringToStdString(env, clsBin).c_str());
+    if (!cp.empty() || !cb.empty()) {
+        if (st.paddle_cls_net.load_param(cp.c_str()) != 0 ||
+            st.paddle_cls_net.load_model(cb.c_str()) != 0) {
+            st.paddle_cls_net.clear();
+            return JNI_FALSE;
+        }
     }
-    if (recParam && recBin) {
-        st.paddle_rec_net.load_param(JStringToStdString(env, recParam).c_str());
-        st.paddle_rec_net.load_model(JStringToStdString(env, recBin).c_str());
+    if (!rp.empty() || !rb.empty()) {
+        if (st.paddle_rec_net.load_param(rp.c_str()) != 0 ||
+            st.paddle_rec_net.load_model(rb.c_str()) != 0) {
+            st.paddle_rec_net.clear();
+            return JNI_FALSE;
+        }
     }
-    st.paddle_dict = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
-                      "A", "B", "C", "D", "E", "F", "G", "H", "I", "J",
-                      "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T",
-                      "U", "V", "W", "X", "Y", "Z", "-", ":", "/", "."};
-    (void)keysPath;
+    if (!LoadPaddleDictionaryFile(kp, st.paddle_dict)) {
+        st.paddle_dict.clear();
+        return JNI_FALSE;
+    }
     return JNI_TRUE;
 }
 
@@ -2110,8 +2885,11 @@ Java_com_xhey_xcamerasdk_algorithm_nn_PhotoStandards_init(
     JNIEnv* env, jobject /*thiz*/, jstring paramPath, jstring binPath) {
     auto& st = GetEdgeState();
     std::lock_guard<std::mutex> lock(st.mtx);
-    st.photo_standards_net.load_param(JStringToStdString(env, paramPath).c_str());
-    st.photo_standards_net.load_model(JStringToStdString(env, binPath).c_str());
+    if (st.photo_standards_net.load_param(JStringToStdString(env, paramPath).c_str()) != 0 ||
+        st.photo_standards_net.load_model(JStringToStdString(env, binPath).c_str()) != 0) {
+        st.photo_standards_net.clear();
+        return JNI_FALSE;
+    }
     return JNI_TRUE;
 }
 
@@ -2174,8 +2952,11 @@ Java_com_xhey_xcamerasdk_algorithm_nn_PortraitMatting_init(
     JNIEnv* env, jobject /*thiz*/, jstring paramPath, jstring binPath) {
     auto& st = GetEdgeState();
     std::lock_guard<std::mutex> lock(st.mtx);
-    st.portrait_matting_net.load_param(JStringToStdString(env, paramPath).c_str());
-    st.portrait_matting_net.load_model(JStringToStdString(env, binPath).c_str());
+    if (st.portrait_matting_net.load_param(JStringToStdString(env, paramPath).c_str()) != 0 ||
+        st.portrait_matting_net.load_model(JStringToStdString(env, binPath).c_str()) != 0) {
+        st.portrait_matting_net.clear();
+        return JNI_FALSE;
+    }
     return JNI_TRUE;
 }
 
@@ -2261,15 +3042,20 @@ Java_com_xhey_xcamerasdk_algorithm_nn_SileroVad_nativeInit(
     ctx->min_silence_samples = (ctx->sample_rate * std::max(0, minSilenceDurationMs)) / 1000;
     ctx->min_speech_samples = (ctx->sample_rate * std::max(0, minSpeechDurationMs)) / 1000;
 
-    if (paramPath && binPath) {
-        ctx->net.load_param(JStringToStdString(env, paramPath).c_str());
-        ctx->net.load_model(JStringToStdString(env, binPath).c_str());
+    std::string pp = JStringToStdString(env, paramPath);
+    std::string bp = JStringToStdString(env, binPath);
+    if (ctx->net.load_param(pp.c_str()) != 0 ||
+        ctx->net.load_model(bp.c_str()) != 0 ||
+        !ctx->net.loaded) {
+        ctx->net.clear();
+        delete ctx;
+        return 0L;
     }
     return reinterpret_cast<jlong>(ctx);
 }
 
 static float RunSileroVadWindow(SileroVadNativeContext* ctx, const float* samples512, int count) {
-    if (!ctx || !samples512 || count <= 0) return 0.0f;
+    if (!ctx || !ctx->net.loaded || !samples512 || count <= 0) return 0.0f;
     ncnn::Mat in0(512);
     in0.fill(0.0f);
     int copyN = std::min(512, count);
@@ -2282,7 +3068,7 @@ static float RunSileroVadWindow(SileroVadNativeContext* ctx, const float* sample
     ex.input("in2", ctx->c_state);
 
     ncnn::Mat out0, out1, out2;
-    ex.extract("out0", out0);
+    if (ex.extract("out0", out0) != 0) return 0.0f;
     ex.extract("out1", out1);
     ex.extract("out2", out2);
 
@@ -2381,8 +3167,11 @@ Java_com_xhey_xcamerasdk_algorithm_nn_SuperResolution_init(
     auto& st = GetEdgeState();
     std::lock_guard<std::mutex> lock(st.mtx);
     st.super_res_net.opt.use_vulkan_compute = (useGpu == JNI_TRUE);
-    st.super_res_net.load_param(JStringToStdString(env, paramPath).c_str());
-    st.super_res_net.load_model(JStringToStdString(env, binPath).c_str());
+    if (st.super_res_net.load_param(JStringToStdString(env, paramPath).c_str()) != 0 ||
+        st.super_res_net.load_model(JStringToStdString(env, binPath).c_str()) != 0) {
+        st.super_res_net.clear();
+        return JNI_FALSE;
+    }
     return JNI_TRUE;
 }
 

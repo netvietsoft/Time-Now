@@ -6,6 +6,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_C_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
+add_compile_options(-ffunction-sections -fdata-sections)
+add_link_options(-Wl,--exclude-libs,ALL -Wl,--gc-sections)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
@@ -26,6 +28,16 @@ set(XHEY_COMMON_LIBS
 )
 
 # ==============================================================================
+# Optional Official Tencent NCNN SDK Integration
+#   - Set -DNCNN_DIR=<path/to/ncnn/lib/cmake/ncnn> or -DNCNN_INCLUDE_DIR + -DNCNN_LIBRARY
+#   - When Tencent NCNN SDK is not present on the build host, the target builds
+#     with the full standalone NCNN DAG & .bin weight execution engine
+#     (XHEY_NCNN_STANDALONE_ENGINE=1) supporting all layers in zero_dce,
+#     zero_dce++, and silero_vad_16k.
+# ==============================================================================
+find_package(ncnn QUIET)
+
+# ==============================================================================
 # 1. libnnpackage-f99779bd.so
 #    Core C++ Edge AI, JpegPacker Steganography, CodeDetect Anti-Fake,
 #    AiRef Feature Encoder, Aegis Hardware Anti-Spoofing, and ROS2 MCAP Engine
@@ -39,7 +51,20 @@ add_library(
     src/aegis_anti_spoof_jni.cpp
     src/mcap_robotics_jni.cpp
 )
-target_link_libraries(nnpackage-f99779bd ${XHEY_COMMON_LIBS})
+if(ncnn_FOUND)
+    message(STATUS "Linking nnpackage-f99779bd with official Tencent NCNN SDK (ncnn::ncnn)")
+    target_compile_definitions(nnpackage-f99779bd PRIVATE XHEY_USE_OFFICIAL_NCNN=1)
+    target_link_libraries(nnpackage-f99779bd ncnn ${XHEY_COMMON_LIBS})
+elseif(DEFINED NCNN_INCLUDE_DIR AND DEFINED NCNN_LIBRARY)
+    message(STATUS "Linking nnpackage-f99779bd with custom NCNN library: ${NCNN_LIBRARY}")
+    target_include_directories(nnpackage-f99779bd PRIVATE ${NCNN_INCLUDE_DIR})
+    target_compile_definitions(nnpackage-f99779bd PRIVATE XHEY_USE_OFFICIAL_NCNN=1)
+    target_link_libraries(nnpackage-f99779bd ${NCNN_LIBRARY} ${XHEY_COMMON_LIBS})
+else()
+    message(STATUS "Building nnpackage-f99779bd with full standalone NCNN DAG & .bin weight engine")
+    target_compile_definitions(nnpackage-f99779bd PRIVATE XHEY_NCNN_STANDALONE_ENGINE=1)
+    target_link_libraries(nnpackage-f99779bd ${XHEY_COMMON_LIBS})
+endif()
 
 # ==============================================================================
 # 2. libxheymediav8.so
