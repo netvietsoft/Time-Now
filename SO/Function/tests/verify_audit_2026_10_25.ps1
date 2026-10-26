@@ -135,10 +135,19 @@ foreach ($reqFile in @($forgedApkPath, $dictFixture)) {
     }
 }
 
+$ndkRev = "unknown"
+$sourceProps = Join-Path $NdkPath "source.properties"
+if (Test-Path $sourceProps) {
+    $revMatch = Select-String -Path $sourceProps -Pattern "Pkg\.Revision\s*=\s*(.+)$" | Select-Object -First 1
+    if ($revMatch) { $ndkRev = $revMatch.Matches[0].Groups[1].Value.Trim() }
+}
+$clangVerLine = ((& $clangpp --version 2>&1) | Select-Object -First 1).ToString().Trim()
+
 Write-Host "============================================================================"
-Write-Host "  AUDIT VERIFICATION SUITE (Reports 11 & 13 - Portable Native C++ Harness)"
+Write-Host "  AUDIT VERIFICATION SUITE (Reports 11, 13, 15, 17 - Native C++ Harness)"
 Write-Host "  RepoRoot  : $RepoRoot"
-Write-Host "  NdkPath   : $NdkPath"
+Write-Host "  NdkPath   : $NdkPath (Pkg.Revision = $ndkRev)"
+Write-Host "  Clang     : $clangVerLine"
 Write-Host "  ApkPath   : $ApkPath"
 Write-Host "  SampleDir : $SampleDir"
 Write-Host "============================================================================"
@@ -366,7 +375,180 @@ Write-Host "  [LINK PASS] Linked ARM64 binary ($arm64Size bytes) cleanly via ld.
 # 3B. Host Native C++ Runtime Execution via NDK clang++ + ld.lld ([RUNTIME PASS])
 $buildDir = Join-Path $env:TEMP "xhey_native_runtime_verify"
 New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
-Remove-Item "$buildDir\*" -Force -ErrorAction SilentlyContinue
+Remove-Item "$buildDir\*" -Recurse -Force -ErrorAction SilentlyContinue
+
+# Generate 64-bit LLP64/LP64 unified stdint.h & inttypes.h shim so that on Windows x64
+# (--target=x86_64-w64-mingw32, where __LP64__ is not defined because long is 32-bit),
+# uintptr_t / intptr_t / __type_name_t use Clang's 64-bit __UINTPTR_TYPE__ / __INTPTR_TYPE__
+# instead of Bionic sysroot/usr/include/stdint.h's 32-bit fallback (fixes Report/17 on NDK 28).
+$shimIncDir = Join-Path $buildDir "shim_include"
+New-Item -ItemType Directory -Force -Path $shimIncDir | Out-Null
+
+$shimStdintContent = @"
+#ifndef _STDINT_H
+#define _STDINT_H
+#define _BITS_STDINT_H_
+
+#include <bits/wchar_limits.h>
+#include <stddef.h>
+#include <sys/cdefs.h>
+
+typedef signed char        __int8_t;
+typedef unsigned char      __uint8_t;
+typedef short              __int16_t;
+typedef unsigned short     __uint16_t;
+typedef int                __int32_t;
+typedef unsigned int       __uint32_t;
+typedef __INT64_TYPE__     __int64_t;
+typedef __UINT64_TYPE__    __uint64_t;
+typedef __INTPTR_TYPE__    __intptr_t;
+typedef __UINTPTR_TYPE__   __uintptr_t;
+
+typedef __int8_t           int8_t;
+typedef __uint8_t          uint8_t;
+typedef __int16_t          int16_t;
+typedef __uint16_t         uint16_t;
+typedef __int32_t          int32_t;
+typedef __uint32_t         uint32_t;
+typedef __int64_t          int64_t;
+typedef __uint64_t         uint64_t;
+typedef __intptr_t         intptr_t;
+typedef __uintptr_t        uintptr_t;
+
+typedef int8_t             int_least8_t;
+typedef uint8_t            uint_least8_t;
+typedef int16_t            int_least16_t;
+typedef uint16_t           uint_least16_t;
+typedef int32_t            int_least32_t;
+typedef uint32_t           uint_least32_t;
+typedef int64_t            int_least64_t;
+typedef uint64_t           uint_least64_t;
+
+typedef int8_t             int_fast8_t;
+typedef uint8_t            uint_fast8_t;
+typedef int64_t            int_fast16_t;
+typedef uint64_t           uint_fast16_t;
+typedef int64_t            int_fast32_t;
+typedef uint64_t           uint_fast32_t;
+typedef int64_t            int_fast64_t;
+typedef uint64_t           uint_fast64_t;
+
+typedef __INTMAX_TYPE__    intmax_t;
+typedef __UINTMAX_TYPE__   uintmax_t;
+
+#ifndef _SSIZE_T_DEFINED_
+#define _SSIZE_T_DEFINED_
+typedef __INTPTR_TYPE__    ssize_t;
+#endif
+
+#define __BIT_TYPES_DEFINED__
+
+#define INT8_C(c)          c
+#define INT_LEAST8_C(c)    INT8_C(c)
+#define INT_FAST8_C(c)     INT8_C(c)
+#define UINT8_C(c)         c
+#define UINT_LEAST8_C(c)   UINT8_C(c)
+#define UINT_FAST8_C(c)    UINT8_C(c)
+
+#define INT16_C(c)         c
+#define INT_LEAST16_C(c)   INT16_C(c)
+#define INT_FAST16_C(c)    INT64_C(c)
+#define UINT16_C(c)        c
+#define UINT_LEAST16_C(c)  UINT16_C(c)
+#define UINT_FAST16_C(c)   UINT64_C(c)
+
+#define INT32_C(c)         c
+#define INT_LEAST32_C(c)   INT32_C(c)
+#define INT_FAST32_C(c)    INT64_C(c)
+#define UINT32_C(c)        c ## U
+#define UINT_LEAST32_C(c)  UINT32_C(c)
+#define UINT_FAST32_C(c)   UINT64_C(c)
+
+#define INT64_C(c)         c ## LL
+#define UINT64_C(c)        c ## ULL
+#define INT_LEAST64_C(c)   INT64_C(c)
+#define INT_FAST64_C(c)    INT64_C(c)
+#define UINT_LEAST64_C(c)  UINT64_C(c)
+#define UINT_FAST64_C(c)   UINT64_C(c)
+
+#define INTMAX_C(c)        INT64_C(c)
+#define UINTMAX_C(c)       UINT64_C(c)
+#define INTPTR_C(c)        INT64_C(c)
+#define UINTPTR_C(c)       UINT64_C(c)
+#define PTRDIFF_C(c)       INT64_C(c)
+
+#define INT8_MIN           (-128)
+#define INT8_MAX           (127)
+#define INT_LEAST8_MIN     INT8_MIN
+#define INT_LEAST8_MAX     INT8_MAX
+#define INT_FAST8_MIN      INT8_MIN
+#define INT_FAST8_MAX      INT8_MAX
+#define UINT8_MAX          (255)
+#define UINT_LEAST8_MAX    UINT8_MAX
+#define UINT_FAST8_MAX     UINT8_MAX
+
+#define INT16_MIN          (-32768)
+#define INT16_MAX          (32767)
+#define INT_LEAST16_MIN    INT16_MIN
+#define INT_LEAST16_MAX    INT16_MAX
+#define INT_FAST16_MIN     INT64_MIN
+#define INT_FAST16_MAX     INT64_MAX
+#define UINT16_MAX         (65535)
+#define UINT_LEAST16_MAX   UINT16_MAX
+#define UINT_FAST16_MAX    UINT64_MAX
+
+#define INT32_MIN          (-2147483647-1)
+#define INT32_MAX          (2147483647)
+#define INT_LEAST32_MIN    INT32_MIN
+#define INT_LEAST32_MAX    INT32_MAX
+#define INT_FAST32_MIN     INT64_MIN
+#define INT_FAST32_MAX     INT64_MAX
+#define UINT32_MAX         (4294967295U)
+#define UINT_LEAST32_MAX   UINT32_MAX
+#define UINT_FAST32_MAX    UINT64_MAX
+
+#define INT64_MIN          (INT64_C(-9223372036854775807)-1)
+#define INT64_MAX          (INT64_C(9223372036854775807))
+#define INT_LEAST64_MIN    INT64_MIN
+#define INT_LEAST64_MAX    INT64_MAX
+#define INT_FAST64_MIN     INT64_MIN
+#define INT_FAST64_MAX     INT64_MAX
+#define UINT64_MAX         (UINT64_C(18446744073709551615))
+#define UINT_LEAST64_MAX   UINT64_MAX
+#define UINT_FAST64_MAX    UINT64_MAX
+
+#define INTMAX_MIN         INT64_MIN
+#define INTMAX_MAX         INT64_MAX
+#define UINTMAX_MAX        UINT64_MAX
+
+#define SIG_ATOMIC_MAX     INT32_MAX
+#define SIG_ATOMIC_MIN     INT32_MIN
+
+#if defined(__WINT_UNSIGNED__)
+#  define WINT_MAX         UINT32_MAX
+#  define WINT_MIN         0
+#else
+#  define WINT_MAX         INT32_MAX
+#  define WINT_MIN         INT32_MIN
+#endif
+
+#define INTPTR_MIN         INT64_MIN
+#define INTPTR_MAX         INT64_MAX
+#define UINTPTR_MAX        UINT64_MAX
+#define PTRDIFF_MIN        INT64_MIN
+#define PTRDIFF_MAX        INT64_MAX
+#define SIZE_MAX           UINT64_MAX
+
+#ifdef __cplusplus
+static_assert(sizeof(void*) == 8,     "Host pointer size must be 64-bit");
+static_assert(sizeof(uintptr_t) == 8, "uintptr_t must be 64-bit");
+static_assert(sizeof(intptr_t) == 8,  "intptr_t must be 64-bit");
+#endif
+
+#endif /* _STDINT_H */
+"@
+$shimStdintPath = Join-Path $shimIncDir "stdint.h"
+Set-Content -Path $shimStdintPath -Value $shimStdintContent -Encoding ASCII
 
 $sysroot    = Join-Path $llvmRoot "sysroot"
 $cxxInc     = Join-Path $sysroot "usr\include\c++\v1"
@@ -387,6 +569,7 @@ if (Test-Path $cxxSiteInc) { $isystemFlags += @("-isystem", $cxxSiteInc) }
 $isystemFlags += @(
     "-isystem", $cxxInc,
     "-isystem", $clangInc,
+    "-isystem", $shimIncDir,
     "-isystem", $archInc,
     "-isystem", $sysInc
 )
@@ -401,11 +584,12 @@ $runtimeSources = @(
 
 foreach ($cpp in $runtimeSources) {
     $objOut = Join-Path $buildDir ((Split-Path $cpp -Leaf) + ".obj")
-    & $clangpp --target=x86_64-w64-mingw32 -std=c++17 -O2 -fno-builtin -fno-exceptions -fno-rtti -mno-stack-arg-probe `
+    & $clangpp --target=x86_64-w64-mingw32 -std=c++17 -O2 -fno-builtin -fno-exceptions -fno-rtti -fno-aligned-allocation -mno-stack-arg-probe `
         -nostdinc -U_WIN32 -U_WIN64 -U__MINGW32__ -U__MINGW64__ -U__MSVCRT__ `
-        -D__ELF__=1 -D_LIBCPP_OBJECT_FORMAT_COFF=1 -D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS=1 `
+        -D__ELF__=1 -D_LIBCPP_OBJECT_FORMAT_COFF=1 -D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS=1 -D_LIBCPP_DISABLE_EXTERN_TEMPLATE=1 `
         -D__linux__=1 -D__ANDROID__=1 -D__ANDROID_API__=28 -D__x86_64__=1 `
         -DXHEY_STANDALONE_TEST_SHIM=1 -DXHEY_WIN64_NDK_HOST_TEST=1 `
+        -include $shimStdintPath `
         $isystemFlags `
         -I (Join-Path $srcRoot "include") `
         -c $cpp -o $objOut

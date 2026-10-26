@@ -98,3 +98,9 @@ invalid local symbol '__bss_start' in global part of symbol table
   ALL 8 VERIFICATION CHECKS PASSED ([LINK PASS] & [RUNTIME PASS] VERIFIED)
 ============================================================================
 ```
+
+> **Ghi chú cập nhật theo [`Report/17_Kiem_Chung_Git_15f912b_2026-10-26.md`](file:///E:/Decompiler/APP/IMAGE/Timemark/Report/17_Kiem_Chung_Git_15f912b_2026-10-26.md):**
+> - Log kiểm chứng ở Mục 3 trên được chạy trên máy dev dùng Unity Android NDK `19.0.5232133` (Clang `8.0.2`).
+> - Trên Android NDK `28.2.13676358` (Clang `19.0.1`), các bước `[1/8]`, `[2/8]` và `[3/8] [LINK PASS]` (với `ld.lld --fatal-warnings`) của commit `15f912b` đã được xác nhận **PASS**, nhưng nhánh biên dịch host runtime Windows x64 (`3B`) gặp lỗi bất đồng bộ kiểu `uintptr_t` / `__type_name_t` (`32-bit unsigned int` vs `64-bit void*`) do `sysroot/usr/include/stdint.h` kiểm tra `#if defined(__LP64__)` trong khi target `--target=x86_64-w64-mingw32` là mô hình `LLP64`.
+> - Khắc phục triệt để lỗi host harness trên NDK 28 được ghi nhận tại [`Report/18_Khac_Phuc_Loi_Host_Harness_NDK28_Report_17_2026-10-26.md`](file:///E:/Decompiler/APP/IMAGE/Timemark/Report/18_Khac_Phuc_Loi_Host_Harness_NDK28_Report_17_2026-10-26.md).
+

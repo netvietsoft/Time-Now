@@ -32,18 +32,32 @@
 
 #include "../include/xhey_jni_models.h"
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
+
+static_assert(sizeof(void*) == sizeof(uintptr_t), "Pointer and uintptr_t sizes must match");
+static_assert(sizeof(void*) == sizeof(intptr_t),  "Pointer and intptr_t sizes must match");
+static_assert(sizeof(void*) == sizeof(size_t),    "Pointer and size_t sizes must match");
 
 // ============================================================================
 // Optional Windows x64 NDK Host Runtime Shim (when compiled via NDK clang++ + ld.lld)
 // ============================================================================
 #if defined(XHEY_WIN64_NDK_HOST_TEST)
+static_assert(sizeof(void*) == 8,     "Win64 host pointer must be 64-bit");
+static_assert(sizeof(uintptr_t) == 8, "Win64 host uintptr_t must be 64-bit");
+static_assert(sizeof(intptr_t) == 8,  "Win64 host intptr_t must be 64-bit");
+static_assert(sizeof(size_t) == 8,    "Win64 host size_t must be 64-bit");
+static_assert(sizeof(ptrdiff_t) == 8, "Win64 host ptrdiff_t must be 64-bit");
+
 void* operator new(size_t sz) {
     void* p = std::malloc(sz ? sz : 1);
     return p;
@@ -61,6 +75,9 @@ void operator delete[](void* p) noexcept {
 void operator delete(void* p, size_t) noexcept {
     if (p) std::free(p);
 }
+void operator delete[](void* p, size_t) noexcept {
+    if (p) std::free(p);
+}
 
 extern "C" {
 void __main() {}
@@ -73,6 +90,14 @@ void __cxa_guard_release(uint64_t* g) {
     *reinterpret_cast<uint8_t*>(g) = 1;
 }
 void __cxa_guard_abort(uint64_t*) {}
+
+// Provide both std::__ndk1::__libcpp_verbose_abort and std::__libcpp_verbose_abort
+// symbols at the object level so NDK r19..r28 (LLVM 8..19) resolve cleanly.
+void xhey_shim_verbose_abort_ndk1(const char*, ...) __asm__("_ZNSt6__ndk122__libcpp_verbose_abortEPKcz");
+void xhey_shim_verbose_abort_ndk1(const char*, ...) { std::abort(); }
+void xhey_shim_verbose_abort_std(const char*, ...) __asm__("_ZNSt22__libcpp_verbose_abortEPKcz");
+void xhey_shim_verbose_abort_std(const char*, ...) { std::abort(); }
+
 double round(double x) {
     return (x >= 0.0) ? std::floor(x + 0.5) : std::ceil(x - 0.5);
 }
@@ -135,6 +160,8 @@ void Win64NdkEntry() {
 
 namespace std {
 inline namespace __ndk1 {
+template class basic_string<char>;
+
 size_t __next_prime(size_t n) {
     if (n <= 2) return 2;
     if ((n & 1) == 0) ++n;
@@ -159,11 +186,13 @@ steady_clock::time_point steady_clock::now() noexcept {
     s_ticks += 104729;
     return time_point(duration(s_ticks));
 }
+system_clock::time_point system_clock::now() noexcept {
+    static int64_t s_sys_ticks = 1745000000000000LL;
+    s_sys_ticks += 1000;
+    return time_point(duration(s_sys_ticks));
+}
 } // namespace chrono
 
-void __libcpp_verbose_abort(const char*, ...) noexcept {
-    std::abort();
-}
 string to_string(int val) {
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%d", val);
@@ -889,6 +918,8 @@ int main(int argc, char** argv) {
     std::printf("  NATIVE C++ RUNTIME VERIFICATION HARNESS (Audit Reports 11 & 13)\n");
     std::printf("  Assets Dir  : %s\n", assetsDir.c_str());
     std::printf("  Fixtures Dir: %s\n", fixturesDir.c_str());
+    std::printf("  ABI Sizes   : void*=%zu, uintptr_t=%zu, intptr_t=%zu, size_t=%zu\n",
+                sizeof(void*), sizeof(uintptr_t), sizeof(intptr_t), sizeof(size_t));
     std::printf("============================================================================\n");
     std::fflush(nullptr);
 
