@@ -539,6 +539,13 @@ typedef __INTPTR_TYPE__    ssize_t;
 #define PTRDIFF_MAX        INT64_MAX
 #define SIZE_MAX           UINT64_MAX
 
+#ifndef _LIBCPP_EXTERN_TEMPLATE
+#define _LIBCPP_EXTERN_TEMPLATE(...)
+#endif
+#ifndef _LIBCPP_EXTERN_TEMPLATE2
+#define _LIBCPP_EXTERN_TEMPLATE2(...)
+#endif
+
 #ifdef __cplusplus
 static_assert(sizeof(void*) == 8,     "Host pointer size must be 64-bit");
 static_assert(sizeof(uintptr_t) == 8, "uintptr_t must be 64-bit");

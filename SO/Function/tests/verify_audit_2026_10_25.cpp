@@ -161,6 +161,15 @@ void Win64NdkEntry() {
 namespace std {
 inline namespace __ndk1 {
 template class basic_string<char>;
+template basic_string<char> operator+<char, char_traits<char>, allocator<char>>(char const*, basic_string<char> const&);
+template basic_string<char> operator+<char, char_traits<char>, allocator<char>>(basic_string<char> const&, basic_string<char> const&);
+template basic_string<char> operator+<char, char_traits<char>, allocator<char>>(char, basic_string<char> const&);
+template basic_string<char> operator+<char, char_traits<char>, allocator<char>>(basic_string<char> const&, char const*);
+template basic_string<char> operator+<char, char_traits<char>, allocator<char>>(basic_string<char> const&, char);
+#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION < 16000
+template class __basic_string_common<true>;
+template class __vector_base_common<true>;
+#endif
 
 size_t __next_prime(size_t n) {
     if (n <= 2) return 2;

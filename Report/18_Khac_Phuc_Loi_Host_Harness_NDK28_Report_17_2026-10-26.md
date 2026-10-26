@@ -100,3 +100,8 @@ sysroot\usr\include\c++\v1\__algorithm\shuffle.h:60:12: error: cast from pointer
   ALL 8 VERIFICATION CHECKS PASSED ([LINK PASS] & [RUNTIME PASS] VERIFIED)
 ============================================================================
 ```
+
+> **Ghi chú cập nhật hậu kiểm (`Report/19` & `Report/20`, 26/10/2026)**:
+> - Kết quả hậu kiểm commit `7b4c99f` trên máy cài Android NDK `28.2.13676358` trong [`Report/19_Kiem_Chung_Git_7b4c99f_2026-10-26.md`](file:///E:/Decompiler/APP/IMAGE/Timemark/Report/19_Kiem_Chung_Git_7b4c99f_2026-10-26.md) xác nhận lỗi `uintptr_t` / `__type_name_t` của `Report/17` đã được giải quyết hoàn toàn (bước `3B` biên dịch thành công cả 5 file `.obj` trên NDK 28), nhưng phát hiện thêm 1 symbol `std::__ndk1::operator+(char const*, std::__ndk1::basic_string<char> const&)` thiếu ở bước link `ld.lld` cuối cùng của `3B` (do `template class basic_string<char>;` chỉ khởi tạo member function, không khởi tạo non-member template `operator+`).
+> - Lỗi link này đã được khắc phục triệt để và ghi nhận chi tiết tại [`Report/20_Khac_Phuc_Loi_Link_Host_Harness_NDK28_Report_19_2026-10-26.md`](file:///E:/Decompiler/APP/IMAGE/Timemark/Report/20_Khac_Phuc_Loi_Link_Host_Harness_NDK28_Report_19_2026-10-26.md).
+
