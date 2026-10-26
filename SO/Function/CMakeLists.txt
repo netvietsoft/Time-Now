@@ -7,7 +7,7 @@ set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_C_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 add_compile_options(-ffunction-sections -fdata-sections)
-add_link_options(-Wl,--exclude-libs,ALL -Wl,--gc-sections)
+add_link_options(-fuse-ld=lld -Wl,--exclude-libs,ALL -Wl,--gc-sections)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 

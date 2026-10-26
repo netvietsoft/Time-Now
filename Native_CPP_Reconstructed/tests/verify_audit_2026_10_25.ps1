@@ -167,12 +167,20 @@ foreach ($rel in $srcFiles) {
     }
     Write-Host ("  - {0,-38} : SHA256 = {1}... (3 copies identical)" -f $rel, $h1.Substring(0, 16))
 }
-Write-Host "  [PASS] All 7 C++/header files are 100% byte-for-byte identical across all 3 locations."
+foreach ($pairRel in @("CMakeLists.txt", "tests\verify_audit_2026_10_25.cpp", "tests\verify_audit_2026_10_25.ps1")) {
+    $p1 = (Get-FileHash (Join-Path $srcRoot $pairRel) -Algorithm SHA256).Hash
+    $p2 = (Get-FileHash (Join-Path $funcDir $pairRel) -Algorithm SHA256).Hash
+    if ($p1 -ne $p2) {
+        throw "Hash mismatch between Native_CPP_Reconstructed and SO/Function for $pairRel : $p1 vs $p2"
+    }
+    Write-Host ("  - {0,-38} : SHA256 = {1}... (2 copies identical)" -f $pairRel, $p1.Substring(0, 16))
+}
+Write-Host "  [PASS] All C++/header/CMake/test files are 100% byte-for-byte identical across directories."
 
 # ----------------------------------------------------------------------------
-# 2. Verify All 7 Built .so Libraries (PT_DYNAMIC, 0 Stubs, 198 STT_FUNC, 159 Java_*)
+# 2. Verify All 7 Built .so Libraries (PT_DYNAMIC, .dynsym/sh_info, 0 Stubs, 198 STT_FUNC, 159 Java_*)
 # ----------------------------------------------------------------------------
-Write-Host "`n[2/8] Auditing 7 compiled ARM64 .so libraries in SO/SO..."
+Write-Host "`n[2/8] Auditing 7 compiled ARM64 .so libraries in SO/SO (PT_DYNAMIC, .dynsym/sh_info, STT_FUNC, Java_*)..."
 $expectedSoNames = @(
     "libffmpeg.so",
     "libjpeg.so",
@@ -208,11 +216,6 @@ Get-ChildItem "$soDir\*.so" | Sort-Object Name | ForEach-Object {
     if (-not ($dynOut | Select-String "Dynamic section at offset")) {
         throw "Missing PT_DYNAMIC in $($_.Name)"
     }
-    $symOut = & $readelf -sW $_.FullName 2>&1
-    $dynSyms = $symOut | Select-String "FUNC\s+GLOBAL\s+DEFAULT\s+\d+\s+"
-    $javaSyms = $dynSyms | Select-String "Java_"
-    $totalFunc += $dynSyms.Count
-    $totalJava += $javaSyms.Count
 
     $fileBytes = [System.IO.File]::ReadAllBytes($_.FullName)
     $stubPattern = "FD-7B-BF-A9-FD-03-00-91-00-00-80-D2-FD-7B-C1-A8-C0-03-5F-D6-1F-20-03-D5-1F-20-03-D5-1F-20-03-D5"
@@ -220,6 +223,103 @@ Get-ChildItem "$soDir\*.so" | Sort-Object Name | ForEach-Object {
     if ($fileHex.Contains($stubPattern)) {
         throw "32-byte AArch64 stub pattern found in $($_.Name)"
     }
+
+    # Validate ELF64 .dynsym sh_info local/global symbol partition, .gnu.version, and .hash
+    $e_shoff     = [System.BitConverter]::ToUInt64($fileBytes, 40)
+    $e_shentsize = [System.BitConverter]::ToUInt16($fileBytes, 58)
+    $e_shnum     = [System.BitConverter]::ToUInt16($fileBytes, 60)
+    $dynsymShInfo  = 0
+    $dynsymOff     = 0
+    $dynsymSize    = 0
+    $dynsymEntSize = 24
+    $versymOff     = 0
+    $hashOff       = 0
+
+    for ($secIdx = 0; $secIdx -lt $e_shnum; $secIdx++) {
+        $secOff    = [int]$e_shoff + ($secIdx * $e_shentsize)
+        $sh_type   = [System.BitConverter]::ToUInt32($fileBytes, $secOff + 4)
+        $sh_offset = [int][System.BitConverter]::ToUInt64($fileBytes, $secOff + 24)
+        $sh_size   = [int][System.BitConverter]::ToUInt64($fileBytes, $secOff + 32)
+        $sh_entsz  = [int][System.BitConverter]::ToUInt64($fileBytes, $secOff + 56)
+        if ($sh_type -eq 11) { # SHT_DYNSYM
+            $dynsymShInfo = [int][System.BitConverter]::ToUInt32($fileBytes, $secOff + 44)
+            $dynsymOff    = $sh_offset
+            $dynsymSize   = $sh_size
+            if ($sh_entsz -gt 0) { $dynsymEntSize = $sh_entsz }
+        } elseif ($sh_type -eq 0x6fffffff) { # SHT_GNU_versym
+            $versymOff = $sh_offset
+        } elseif ($sh_type -eq 5) { # SHT_HASH
+            $hashOff = $sh_offset
+        }
+    }
+
+    if ($dynsymOff -le 0 -or $dynsymSize -le 0) {
+        throw "Missing SHT_DYNSYM section in $($_.Name)"
+    }
+    $numDynsyms = [int]($dynsymSize / $dynsymEntSize)
+    if ($dynsymShInfo -le 0 -or $dynsymShInfo -gt $numDynsyms) {
+        throw "Invalid .dynsym sh_info=$dynsymShInfo (numDynsyms=$numDynsyms) in $($_.Name)"
+    }
+    for ($s = 0; $s -lt $numDynsyms; $s++) {
+        $symOff   = $dynsymOff + ($s * $dynsymEntSize)
+        $st_info  = $fileBytes[$symOff + 4]
+        $st_shndx = [System.BitConverter]::ToUInt16($fileBytes, $symOff + 6)
+        $bind     = ($st_info -shr 4) -band 0x0F
+        if ($s -lt $dynsymShInfo -and $bind -ne 0) {
+            throw "Non-local symbol (bind=$bind) at .dynsym index $s (< sh_info=$dynsymShInfo) in $($_.Name)"
+        }
+        if ($s -ge $dynsymShInfo -and $bind -eq 0) {
+            throw "Invalid STB_LOCAL symbol at .dynsym index $s (>= sh_info=$dynsymShInfo) in global part of symbol table in $($_.Name)"
+        }
+        if ($versymOff -gt 0) {
+            $ver = [System.BitConverter]::ToUInt16($fileBytes, $versymOff + ($s * 2))
+            if ($s -lt $dynsymShInfo -and $ver -ne 0) {
+                throw "Local symbol at .dynsym index $s has non-local .gnu.version=$ver in $($_.Name)"
+            }
+            if ($s -ge $dynsymShInfo -and $st_shndx -ne 0 -and $ver -eq 0) {
+                throw "Defined global symbol at .dynsym index $s has local .gnu.version=0 in $($_.Name)"
+            }
+        }
+    }
+    if ($hashOff -gt 0) {
+        $nbucket = [System.BitConverter]::ToUInt32($fileBytes, $hashOff)
+        $nchain  = [System.BitConverter]::ToUInt32($fileBytes, $hashOff + 4)
+        if ($nchain -ne $numDynsyms) {
+            throw ".hash nchain ($nchain) != .dynsym count ($numDynsyms) in $($_.Name)"
+        }
+        for ($b = 0; $b -lt $nbucket; $b++) {
+            $cur = [int][System.BitConverter]::ToUInt32($fileBytes, $hashOff + 8 + ($b * 4))
+            while ($cur -ne 0) {
+                if ($cur -lt $dynsymShInfo) {
+                    throw "Local symbol index $cur (< sh_info=$dynsymShInfo) present in .hash chain in $($_.Name)"
+                }
+                $cur = [int][System.BitConverter]::ToUInt32($fileBytes, $hashOff + 8 + ($nbucket * 4) + ($cur * 4))
+            }
+        }
+    }
+
+    # Cross-check readelf --dyn-syms output against sh_info
+    $dynSymLines = & $readelf --dyn-syms -W $_.FullName 2>&1
+    foreach ($dLine in $dynSymLines) {
+        $strLine = $dLine.ToString()
+        if ($strLine -match "^\s*(\d+):\s+[0-9a-fA-F]+\s+\d+\s+\S+\s+(LOCAL|GLOBAL|WEAK)\s+") {
+            $idx  = [int]$Matches[1]
+            $bindStr = $Matches[2]
+            if ($idx -lt $dynsymShInfo -and $bindStr -ne "LOCAL") {
+                throw "readelf --dyn-syms: non-LOCAL symbol at index $idx (< sh_info=$dynsymShInfo) in $($_.Name)"
+            }
+            if ($idx -ge $dynsymShInfo -and $bindStr -eq "LOCAL") {
+                throw "readelf --dyn-syms: invalid LOCAL symbol at index $idx (>= sh_info=$dynsymShInfo) in $($_.Name): $strLine"
+            }
+        }
+    }
+
+    $symOut = & $readelf -sW $_.FullName 2>&1
+    $dynSyms = $symOut | Select-String "FUNC\s+GLOBAL\s+DEFAULT\s+\d+\s+"
+    $javaSyms = $dynSyms | Select-String "Java_"
+    $totalFunc += $dynSyms.Count
+    $totalJava += $javaSyms.Count
+
     foreach ($line in $dynSyms) {
         if ($line.Line -match "^\s*\d+:\s+[0-9a-fA-F]+\s+(\d+)\s+FUNC\s+GLOBAL\s+DEFAULT\s+\d+\s+(\S+)") {
             $sz = [int]$Matches[1]
@@ -229,12 +329,12 @@ Get-ChildItem "$soDir\*.so" | Sort-Object Name | ForEach-Object {
             }
         }
     }
-    Write-Host ("  - {0,-26} | {1,7} B | PT_DYNAMIC=YES | STT_FUNC={2,3} | Java_*={3,3}" -f $_.Name, $_.Length, $dynSyms.Count, $javaSyms.Count)
+    Write-Host ("  - {0,-26} | {1,7} B | PT_DYNAMIC=YES | sh_info={2} (LOCAL=0..{3}, GLOBAL={2}..{4,3}) | STT_FUNC={5,3} | Java_*={6,3}" -f $_.Name, $_.Length, $dynsymShInfo, ($dynsymShInfo - 1), ($numDynsyms - 1), $dynSyms.Count, $javaSyms.Count)
 }
 if ($totalFunc -ne 198 -or $totalJava -ne 159) {
     throw "Expected 198 STT_FUNC and 159 Java_* symbols, got $totalFunc and $totalJava"
 }
-Write-Host "  [PASS] Total STT_FUNC = $totalFunc, Total Java_* = $totalJava, Stub count = 0/198."
+Write-Host "  [PASS] All 7 .so have valid .dynsym/sh_info boundaries (0 local-in-global symbols), Total STT_FUNC = $totalFunc, Total Java_* = $totalJava, Stub count = 0/198."
 foreach ($k in $keySymbols) {
     if (-not $foundKeySyms.ContainsKey($k)) {
         throw "Audited symbol missing from .so exports: $k"
@@ -247,13 +347,13 @@ foreach ($k in $keySymbols) {
 # ----------------------------------------------------------------------------
 Write-Host "`n[3/8] Compiling, linking, and executing native C++ verification harness (verify_audit_2026_10_25.cpp)..."
 
-# 3A. ARM64 Link Verification against SO/SO/*.so ([LINK PASS])
+# 3A. ARM64 Link Verification against all 7 SO/SO/*.so with ld.lld --fatal-warnings ([LINK PASS])
 $arm64Out = Join-Path $env:TEMP "verify_audit_2026_10_25_arm64"
 Remove-Item $arm64Out -Force -ErrorAction SilentlyContinue
-& $clangpp --target=aarch64-linux-android28 -fno-addrsig -stdlib=libc++ -std=c++17 -O2 `
+& $clangpp --target=aarch64-linux-android28 -fuse-ld=lld "-Wl,--fatal-warnings" -fno-addrsig -stdlib=libc++ -std=c++17 -O2 `
     "-I$srcRoot\include" `
     "$srcRoot\tests\verify_audit_2026_10_25.cpp" `
-    "-L$soDir" -lnnpackage-f99779bd -lnative-lib -lxheymediav8 `
+    "-L$soDir" -lnnpackage-f99779bd -lnative-lib -lxheymediav8 -lxhey_videoedit -lffmpeg -ljpeg -lmp3lame `
     -llog -landroid -ljnigraphics -lGLESv2 -lEGL -lmediandk -lm `
     -o $arm64Out
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path $arm64Out)) {
@@ -261,7 +361,7 @@ if ($LASTEXITCODE -ne 0 -or -not (Test-Path $arm64Out)) {
 }
 $arm64Size = (Get-Item $arm64Out).Length
 Remove-Item $arm64Out -Force -ErrorAction SilentlyContinue
-Write-Host "  [LINK PASS] Linked ARM64 binary ($arm64Size bytes) cleanly against libnnpackage-f99779bd.so, libnative-lib.so, libxheymediav8.so."
+Write-Host "  [LINK PASS] Linked ARM64 binary ($arm64Size bytes) cleanly via ld.lld (--fatal-warnings) against all 7 SO/SO/*.so libraries."
 
 # 3B. Host Native C++ Runtime Execution via NDK clang++ + ld.lld ([RUNTIME PASS])
 $buildDir = Join-Path $env:TEMP "xhey_native_runtime_verify"
